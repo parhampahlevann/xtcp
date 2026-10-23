@@ -31,6 +31,16 @@ PIPE_SERVER_PORT="17000"
 PIPE_VISITOR_PORT="17001"
 MTU="1280"
 
+# Fixed shared credentials: used on both the Iran side (generated into
+# frps/frpc-iran config) and the outside side (no longer prompted for),
+# so both ends always match without the outside install asking for them.
+# NOTE: since this value lives in the script itself, anyone who gets a
+# copy of the script gets the same token/secret as every other install
+# made from it. Fine for a single private Iran<->outside pair; if this
+# script is ever copied to another box pair, change these two lines first.
+DEFAULT_FRP_TOKEN="740ef87eef4da026d23581899eac95a2015c6eb3d227040d18c28d5ddc86f92d"
+DEFAULT_XTCP_SECRET="81fdeae86511c25c380b37e6e20ceffa1cb13f7d0edff61bf08f86eb78db187b"
+
 log() { printf '\n\033[1;32m[XTCP-TUN]\033[0m %s\n' "$*"; }
 warn() { printf '\n\033[1;33m[WARNING]\033[0m %s\n' "$*" >&2; }
 die() { printf '\n\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -461,8 +471,8 @@ install_iran() {
   valid_ipv4 "$iran_ip" || die "No valid public IPv4 was entered."
   read -rp "Public IPv4 of the outside server, to allow UDP if UFW is active (press Enter to skip): " peer_ip
   if [[ -n "$peer_ip" ]] && ! valid_ipv4 "$peer_ip"; then die "The outside server's IP is not valid."; fi
-  frp_token="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-  xtcp_secret="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  frp_token="$DEFAULT_FRP_TOKEN"
+  xtcp_secret="$DEFAULT_XTCP_SECRET"
   printf 'iran\n' > "$CONF_DIR/role"
   printf '%s\n' "$iran_ip" > "$CONF_DIR/iran_public_ip"
   printf '%s\n' "$frp_token" > "$CONF_DIR/frp_token"
@@ -517,10 +527,8 @@ install_outside() {
   local iran_ip frp_token xtcp_secret
   read -rp "Public IPv4 of the Iran server: " iran_ip
   valid_ipv4 "$iran_ip" || die "The Iran server's public IPv4 is not valid."
-  read -rsp "FRP Token shown during the Iran-side install: " frp_token; printf '\n'
-  [[ "$frp_token" =~ ^[A-Za-z0-9_-]{32,128}$ ]] || die "Invalid FRP Token format. Enter the full 64-character code."
-  read -rsp "XTCP SecretKey shown during the Iran-side install: " xtcp_secret; printf '\n'
-  [[ "$xtcp_secret" =~ ^[A-Za-z0-9_-]{32,128}$ ]] || die "Invalid XTCP SecretKey format. Enter the full 64-character code."
+  frp_token="$DEFAULT_FRP_TOKEN"
+  xtcp_secret="$DEFAULT_XTCP_SECRET"
   printf 'outside\n' > "$CONF_DIR/role"
   printf '%s\n' "$iran_ip" > "$CONF_DIR/iran_public_ip"
   printf '%s\n' "$frp_token" > "$CONF_DIR/frp_token"
