@@ -15,6 +15,12 @@
 #   - Add/remove forward now accept a comma-separated list of ports in one
 #     go, e.g. "1080,443", optionally with a different target port per
 #     entry using "listen:target", e.g. "1080:1081,443".
+#   - XTCP is no longer the only path: the outside agent now tries, in
+#     order, the local FRP visitor (which itself falls back internally
+#     from xtcp/quic -> xtcp/kcp -> stcp), then a direct 'tcp' type proxy,
+#     then frps's tcpmux (HTTP CONNECT) port - each one independent of
+#     the frpc<->frps control connection actually needing to work, for
+#     resilience if that connection itself is blocked.
 set -Eeuo pipefail
 
 FRP_VERSION="0.71.1"
@@ -40,6 +46,40 @@ MTU="1280"
 # script is ever copied to another box pair, change these two lines first.
 DEFAULT_FRP_TOKEN="740ef87eef4da026d23581899eac95a2015c6eb3d227040d18c28d5ddc86f92d"
 DEFAULT_XTCP_SECRET="81fdeae86511c25c380b37e6e20ceffa1cb13f7d0edff61bf08f86eb78db187b"
+
+# STUN server both frpc instances use to discover their own public
+# address for XTCP (P2P) NAT hole punching. The frp default,
+# stun.easyvoip.com:3478, is often unreachable from inside Iran, which
+# by itself is enough to make XTCP fail outright (protocol choice never
+# even comes into play). If XTCP still won't connect, test this host's
+# reachability (UDP) from the Iran server first and swap in a reachable
+# STUN server here.
+NAT_HOLE_STUN_SERVER="stun.easyvoip.com:3478"
+# How long (ms) XTCP waits for direct P2P hole punching with one
+# transport before moving to the next one in the fallback chain
+# (quic -> kcp -> guaranteed stcp relay through frps).
+XTCP_FALLBACK_TIMEOUT_MS="1500"
+
+# Two more, independent fallback paths used only if the whole FRP-visitor
+# chain above (quic/kcp/stcp) can't even be reached - e.g. the frpc<->frps
+# control connection on $FRPS_PORT itself is blocked. Both are public ports
+# exposed straight off frps on the Iran server, so the outside agent can
+# reach them WITHOUT going through its own frpc/control-channel at all.
+# TCP_FALLBACK_PORT: a plain 'tcp' type frp proxy - a raw forwarded port,
+#   no NAT traversal needed, works as long as this port itself is reachable.
+# TCPMUX_PORT / TCPMUX_DOMAIN: frps's tcpmuxHTTPConnectPort - the outside
+#   agent connects and sends a plain HTTP CONNECT request, so on the wire
+#   this looks like ordinary HTTPS forward-proxy traffic rather than a
+#   custom tunnel protocol. Change TCPMUX_PORT to 443 for the strongest
+#   camouflage IF nothing else on the Iran server already uses that port.
+# NOTE: unlike xtcp/stcp, tcp/tcpmux proxies have no secretKey gating -
+# anyone who finds these two ports can connect straight into the tunnel.
+# The installer restricts both to the outside server's IP via ufw when
+# that IP is given; without it they're left open to the internet - still
+# worth locking down by hand (ufw/iptables/cloud firewall) to that IP.
+TCP_FALLBACK_PORT="17002"
+TCPMUX_PORT="8443"
+TCPMUX_DOMAIN="xtcp-l3"
 
 log() { printf '\n\033[1;32m[XTCP-TUN]\033[0m %s\n' "$*"; }
 warn() { printf '\n\033[1;33m[WARNING]\033[0m %s\n' "$*" >&2; }
@@ -177,11 +217,11 @@ def parse_addr(value):
     return host, p
 
 
-def bridge(conn, tun_fd, mtu, label):
+def bridge(conn, tun_fd, mtu, label, preload=b""):
     conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     conn.settimeout(None)
-    buf = bytearray()
+    buf = bytearray(preload)
     last_rx = time.monotonic()
     next_heartbeat = last_rx + 15.0
     log(f"Tunnel stream connected ({label})")
@@ -244,28 +284,87 @@ def run_server(args, tun_fd):
         time.sleep(0.5)
 
 
+def tcpmux_connect(host, port, connect_host, timeout=10):
+    """Open conn via frps's tcpmuxHTTPConnectPort: a plain TCP connect followed
+    by an HTTP CONNECT request, so the traffic looks like an ordinary HTTPS
+    forward-proxy request rather than a custom tunnel protocol. Returns
+    (socket, preload) where preload is any tunnel bytes read past the HTTP
+    response headers in the same recv() call."""
+    sock = socket.create_connection((host, port), timeout=timeout)
+    sock.settimeout(timeout)
+    try:
+        sock.sendall(f"CONNECT {connect_host} HTTP/1.1\r\nHost: {connect_host}\r\n\r\n".encode("ascii"))
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("tcpmux: connection closed during CONNECT handshake")
+            buf += chunk
+            if len(buf) > 8192:
+                raise ConnectionError("tcpmux: CONNECT response too large")
+        head, preload = buf.split(b"\r\n\r\n", 1)
+        status_line = head.split(b"\r\n", 1)[0].decode("latin1", "replace")
+        parts = status_line.split(" ")
+        if len(parts) < 2 or parts[1] != "200":
+            raise ConnectionError(f"tcpmux: CONNECT rejected: {status_line!r}")
+    except Exception:
+        sock.close()
+        raise
+    sock.settimeout(None)
+    return sock, preload
+
+
 def run_client(args, tun_fd):
-    host, port = parse_addr(args.connect)
+    local_addr = parse_addr(args.connect)
+    direct_tcp_addr = parse_addr(args.direct_tcp) if args.direct_tcp else None
+    tcpmux_addr = parse_addr(args.tcpmux) if args.tcpmux else None
+
+    def try_local():
+        host, port = local_addr
+        log(f"Trying local FRP visitor at {host}:{port} (xtcp/quic -> xtcp/kcp -> stcp)")
+        return socket.create_connection((host, port), timeout=10), b""
+
+    def try_direct_tcp():
+        host, port = direct_tcp_addr
+        log(f"Trying direct TCP fallback at {host}:{port}")
+        return socket.create_connection((host, port), timeout=10), b""
+
+    def try_tcpmux():
+        host, port = tcpmux_addr
+        log(f"Trying TCPMUX (HTTP CONNECT) fallback at {host}:{port}")
+        return tcpmux_connect(host, port, args.tcpmux_host, timeout=10)
+
+    # Tried in this order every cycle: best-performing path first, each
+    # weaker/slower-but-more-likely-to-get-through option after it. Any one
+    # of these failing just advances to the next; none configured (empty
+    # --direct-tcp/--tcpmux) means that step is skipped entirely.
+    attempts = [("local FRP visitor (xtcp/stcp)", try_local)]
+    if direct_tcp_addr:
+        attempts.append(("direct TCP fallback", try_direct_tcp))
+    if tcpmux_addr:
+        attempts.append(("TCPMUX fallback", try_tcpmux))
+
     delay = 2
+    idx = 0
     sd_notify("READY=1")
     while True:
+        label, attempt = attempts[idx % len(attempts)]
         conn = None
         try:
-            log(f"Connecting to local FRP XTCP visitor {host}:{port}")
-            conn = socket.create_connection((host, port), timeout=10)
+            conn, preload = attempt()
             conn.settimeout(None)
-            bridge(conn, tun_fd, args.mtu, "client")
-            delay = 2
+            bridge(conn, tun_fd, args.mtu, label, preload=preload)
         except KeyboardInterrupt:
             raise
         except Exception as exc:
-            log(f"Connection failed/closed: {exc}; retry in {delay}s")
+            log(f"{label} failed/closed: {exc}; retry in {delay}s")
         finally:
             if conn is not None:
                 try:
                     conn.close()
                 except OSError:
                     pass
+        idx += 1
         time.sleep(delay)
         delay = min(delay * 2, 15)
 
@@ -282,6 +381,12 @@ def main():
     client.add_argument("--dev", default="xtcp0")
     client.add_argument("--cidr", default="10.0.0.2/30")
     client.add_argument("--connect", default="127.0.0.1:17001")
+    client.add_argument("--direct-tcp", default=None,
+                         help="HOST:PORT of a plain 'tcp' type frp proxy, tried if the local FRP visitor fails")
+    client.add_argument("--tcpmux", default=None,
+                         help="HOST:PORT of frps's tcpmuxHTTPConnectPort, tried last via an HTTP CONNECT request")
+    client.add_argument("--tcpmux-host", default="xtcp-l3",
+                         help="Host value sent in the tcpmux CONNECT request; must match the proxy's customDomains entry")
     client.add_argument("--mtu", type=int, default=1280)
     args = parser.parse_args()
     if not 576 <= args.mtu <= 9000:
@@ -322,11 +427,13 @@ setup_ufw_iran() {
   if [[ -n "$peer_ip" ]] && valid_ipv4 "$peer_ip"; then
     if ! ufw status 2>/dev/null | grep -F "$peer_ip" | grep -q 'ALLOW'; then
       ufw allow from "$peer_ip" to any proto udp comment 'xtcp-tun-managed' >/dev/null
+      ufw allow from "$peer_ip" to any port "$TCP_FALLBACK_PORT" proto tcp comment 'xtcp-tun-managed' >/dev/null
+      ufw allow from "$peer_ip" to any port "$TCPMUX_PORT" proto tcp comment 'xtcp-tun-managed' >/dev/null
       printf '%s\n' "$peer_ip" > "$CONF_DIR/ufw_added_udp_peer"
-      log "UFW: allowed UDP from the XTCP client's IP."
+      log "UFW: allowed UDP (XTCP), TCP/$TCP_FALLBACK_PORT and TCP/$TCPMUX_PORT (tcp/tcpmux fallbacks) from the outside server's IP."
     fi
   else
-    warn "UFW is active; for XTCP to succeed, inbound UDP from the peer must be allowed. On the Iran install, enter the outside server's public IP, or add the right rule manually."
+    warn "UFW is active; for XTCP, and the tcp/tcpmux fallbacks (ports $TCP_FALLBACK_PORT, $TCPMUX_PORT), to work, inbound UDP and those two TCP ports must be allowed from the outside server. On the Iran install, enter the outside server's public IP, or add the right rules manually."
   fi
 }
 
@@ -428,7 +535,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=notify
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 $AGENT_PATH client --dev $TUN_DEV --cidr $OUTSIDE_TUN_IP/30 --connect 127.0.0.1:$PIPE_VISITOR_PORT --mtu $MTU
+ExecStart=/usr/bin/python3 $AGENT_PATH client --dev $TUN_DEV --cidr $OUTSIDE_TUN_IP/30 --connect 127.0.0.1:$PIPE_VISITOR_PORT --direct-tcp $iran_ip:$TCP_FALLBACK_PORT --tcpmux $iran_ip:$TCPMUX_PORT --tcpmux-host $TCPMUX_DOMAIN --mtu $MTU
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -485,6 +592,7 @@ install_iran() {
   cat > "$CONF_DIR/frps.toml" <<EOF2
 bindAddr = "0.0.0.0"
 bindPort = $FRPS_PORT
+tcpmuxHTTPConnectPort = $TCPMUX_PORT
 auth.method = "token"
 auth.token = "$frp_token"
 log.to = "$LOG_DIR/frps.log"
@@ -494,6 +602,7 @@ EOF2
   cat > "$CONF_DIR/frpc-iran.toml" <<EOF2
 serverAddr = "127.0.0.1"
 serverPort = $FRPS_PORT
+natHoleStunServer = "$NAT_HOLE_STUN_SERVER"
 auth.method = "token"
 auth.token = "$frp_token"
 log.to = "$LOG_DIR/frpc-iran.log"
@@ -506,6 +615,38 @@ type = "xtcp"
 secretKey = "$xtcp_secret"
 localIP = "127.0.0.1"
 localPort = $PIPE_SERVER_PORT
+
+# Guaranteed relay-through-frps path, used automatically whenever direct
+# XTCP hole punching (quic or kcp, see frpc-outside.toml) fails or times
+# out. Same local target as the xtcp proxy above.
+[[proxies]]
+name = "xtcp-l3-stcp"
+type = "stcp"
+secretKey = "$xtcp_secret"
+localIP = "127.0.0.1"
+localPort = $PIPE_SERVER_PORT
+
+# Direct public-port fallback, reachable without going through frpc's own
+# control connection at all (see run_client's --direct-tcp on the outside
+# agent). No secretKey gating - restricted to the outside server's IP via
+# ufw by setup_ufw_iran when that IP is known.
+[[proxies]]
+name = "xtcp-l3-tcp"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = $PIPE_SERVER_PORT
+remotePort = $TCP_FALLBACK_PORT
+
+# Same idea, but reached via an HTTP CONNECT request to frps's tcpmux
+# port, so on the wire it looks like ordinary HTTPS forward-proxy traffic.
+# No secretKey gating here either - same ufw restriction as above applies.
+[[proxies]]
+name = "xtcp-l3-tcpmux"
+type = "tcpmux"
+multiplexer = "httpconnect"
+customDomains = ["$TCPMUX_DOMAIN"]
+localIP = "127.0.0.1"
+localPort = $PIPE_SERVER_PORT
 EOF2
   chmod 600 "$CONF_DIR"/*.toml
   make_iran_units
@@ -514,7 +655,7 @@ EOF2
   systemctl enable --now xtcp-tun-frps.service xtcp-tun-agent.service xtcp-tun-frpc-iran.service xtcp-tun-rules.service
   log "Iran-side install complete. Use this information to connect the outside server:"
   printf '\n  Iran IP:        %s\n  FRP Token:      %s\n  XTCP SecretKey: %s\n\n' "$iran_ip" "$frp_token" "$xtcp_secret"
-  printf 'Also open inbound TCP port %s in the Iran datacenter'"'"'s firewall panel.\n' "$FRPS_PORT"
+  printf 'Also open inbound TCP ports %s (control), %s (tcp fallback) and %s (tcpmux fallback) in the Iran datacenter'"'"'s firewall panel - ideally restricted to the outside server'"'"'s IP.\n' "$FRPS_PORT" "$TCP_FALLBACK_PORT" "$TCPMUX_PORT"
   printf 'Now run this same script on the outside server and choose option 2.\n'
 }
 
@@ -537,14 +678,22 @@ install_outside() {
   cat > "$CONF_DIR/frpc-outside.toml" <<EOF2
 serverAddr = "$iran_ip"
 serverPort = $FRPS_PORT
+natHoleStunServer = "$NAT_HOLE_STUN_SERVER"
 auth.method = "token"
 auth.token = "$frp_token"
 log.to = "$LOG_DIR/frpc-outside.log"
 log.level = "info"
 log.maxDays = 3
 
+# tun-agent.py connects to 127.0.0.1:$PIPE_VISITOR_PORT, which this first
+# visitor binds. Whichever of the three ends up succeeding (direct XTCP
+# over QUIC, direct XTCP over KCP, or the relayed STCP fallback) is
+# transparent to it - it always sees one plain local TCP connection.
+
+# 1) Try direct P2P over QUIC first (lowest overhead/latency when hole
+#    punching succeeds).
 [[visitors]]
-name = "xtcp-l3-visitor"
+name = "xtcp-l3-visitor-quic"
 type = "xtcp"
 serverName = "xtcp-l3"
 secretKey = "$xtcp_secret"
@@ -554,6 +703,36 @@ protocol = "quic"
 keepTunnelOpen = true
 maxRetriesAnHour = 60
 minRetryInterval = 15
+fallbackTo = "xtcp-l3-visitor-kcp"
+fallbackTimeoutMs = $XTCP_FALLBACK_TIMEOUT_MS
+
+# 2) If QUIC hole punching doesn't succeed in time, try direct P2P over
+#    KCP - a different NAT type/path sometimes gets through when QUIC
+#    doesn't, or vice versa.
+[[visitors]]
+name = "xtcp-l3-visitor-kcp"
+type = "xtcp"
+serverName = "xtcp-l3"
+secretKey = "$xtcp_secret"
+bindPort = -1
+protocol = "kcp"
+keepTunnelOpen = true
+maxRetriesAnHour = 60
+minRetryInterval = 15
+fallbackTo = "xtcp-l3-stcp-visitor"
+fallbackTimeoutMs = $XTCP_FALLBACK_TIMEOUT_MS
+
+# 3) Guaranteed path: relayed through frps on the Iran server like a
+#    normal tunnel. No NAT traversal needed, so this always works as
+#    long as the control connection to frps is up; it's only slightly
+#    slower than a successful direct XTCP connection, since frps and the
+#    Iran-side proxy are on the very same host.
+[[visitors]]
+name = "xtcp-l3-stcp-visitor"
+type = "stcp"
+serverName = "xtcp-l3-stcp"
+secretKey = "$xtcp_secret"
+bindPort = -1
 EOF2
   chmod 600 "$CONF_DIR"/*.toml
   make_outside_units
@@ -563,7 +742,7 @@ EOF2
   log "Outside-side install complete. Check the status after a few seconds."
   printf 'Iran tunnel IP:    %s\nOutside tunnel IP: %s\n' "$IRAN_TUN_IP" "$OUTSIDE_TUN_IP"
   printf 'Once XTCP NAT traversal succeeds, IP packets will pass through the %s interface.\n' "$TUN_DEV"
-  printf 'Open inbound TCP port %s in the Iran datacenter'"'"'s firewall panel.\n' "$FRPS_PORT"
+  printf 'Make sure TCP ports %s, %s and %s are open on the Iran server (datacenter firewall + ufw).\n' "$FRPS_PORT" "$TCP_FALLBACK_PORT" "$TCPMUX_PORT"
 }
 
 ipt() { iptables -w "$@"; }
@@ -648,7 +827,7 @@ status_all() {
     fi
   done
   printf '\n--- Related connections ---\n'
-  ss -tnp 2>/dev/null | grep -E ':(7000|17000|17001)\b' || true
+  ss -tnp 2>/dev/null | grep -E ":($FRPS_PORT|$PIPE_SERVER_PORT|$PIPE_VISITOR_PORT|$TCP_FALLBACK_PORT|$TCPMUX_PORT)\b" || true
   if [[ "$(cat "$CONF_DIR/role")" == iran ]]; then
     printf '\n--- Registered forwards (protocol listen-port target-port) ---\n'
     if [[ -s "$CONF_DIR/forwards.tsv" ]]; then sed 's/^/  /' "$CONF_DIR/forwards.tsv"; else printf '  No ports defined yet.\n'; fi
@@ -810,7 +989,11 @@ uninstall_all() {
   fi
   if [[ -f "$CONF_DIR/ufw_added_udp_peer" ]] && command -v ufw >/dev/null 2>&1; then
     peer="$(cat "$CONF_DIR/ufw_added_udp_peer" 2>/dev/null || true)"
-    if valid_ipv4 "$peer"; then ufw --force delete allow from "$peer" to any proto udp >/dev/null 2>&1 || true; fi
+    if valid_ipv4 "$peer"; then
+      ufw --force delete allow from "$peer" to any proto udp >/dev/null 2>&1 || true
+      ufw --force delete allow from "$peer" to any port "$TCP_FALLBACK_PORT" proto tcp >/dev/null 2>&1 || true
+      ufw --force delete allow from "$peer" to any port "$TCPMUX_PORT" proto tcp >/dev/null 2>&1 || true
+    fi
   fi
   rm -f /etc/systemd/system/xtcp-tun-frps.service \
         /etc/systemd/system/xtcp-tun-agent.service \
