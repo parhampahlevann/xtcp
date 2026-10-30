@@ -2,6 +2,25 @@
 # XTCP-TUN Manager: IPv4 TUN-over-FRP-XTCP for Ubuntu/Debian
 #
 # Changes in this revision:
+#   - FRP pinned to v0.61.1 (was v0.71.1): the older release has been more
+#     stable for this use case.
+#   - Both installs (Iran and outside) now ask which transport protocol
+#     frpc should use to reach frps: tcp (default - just press Enter),
+#     kcp, quic, websocket (ws) or wss. This is FRP's own
+#     transport.protocol setting for the frpc<->frps control connection,
+#     separate from the xtcp proxy's own internal quic/kcp hole-punching
+#     attempts below, which are unaffected and still tried automatically.
+#     Whatever is chosen MUST be the same on both servers; the Iran
+#     install prints its choice at the end, and it's also shown by menu
+#     option 10 (credentials) and option 3 (status).
+#   - The Iran install no longer requires a separate trip to menu option
+#     7 just to get traffic flowing: right after the services come up it
+#     waits for the tunnel interface, then asks directly for the port(s)
+#     to forward (comma-separated, e.g. "1080,443"), same as before.
+#     Pressing Enter there skips it and it can still be done later from
+#     option 7.
+#
+# Previous revision:
 #   - All user-facing text translated from Persian to English.
 #   - Menu actions now run in subshells, so a bad input or a failed step
 #     (which calls die()/exit) only aborts that one action instead of
@@ -23,7 +42,7 @@
 #     resilience if that connection itself is blocked.
 set -Eeuo pipefail
 
-FRP_VERSION="0.71.1"
+FRP_VERSION="0.61.1"
 BASE_DIR="/opt/xtcp-tun"
 CONF_DIR="/etc/xtcp-tun"
 LOG_DIR="/var/log/xtcp-tun"
@@ -97,6 +116,32 @@ PY
 }
 valid_port() {
   [[ "${1:-}" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+# Prompts for which protocol frpc should use to reach frps (FRP's own
+# transport.protocol setting for the frpc<->frps control connection -
+# separate from the xtcp proxy's own quic/kcp hole-punching attempts,
+# which are unaffected and still tried automatically either way).
+# Sets $CHOSEN_TRANSPORT_PROTOCOL. Whatever is picked here must be the
+# same on both the Iran and outside installs.
+choose_transport_protocol() {
+  local choice
+  printf '\nConnection protocol between the two servers (frpc -> frps):\n'
+  printf '  1) tcp        - default, most stable, recommended\n'
+  printf '  2) kcp        - UDP-based, can lower latency, less reliable through strict firewalls\n'
+  printf '  3) quic       - UDP-based, modern, needs solid UDP reachability\n'
+  printf '  4) websocket  - ws: TCP + HTTP upgrade, blends in with ordinary web traffic\n'
+  printf '  5) wss        - ws + TLS, blends in with ordinary HTTPS traffic\n'
+  read -rp "Choice [1]: " choice
+  case "${choice:-1}" in
+    1) CHOSEN_TRANSPORT_PROTOCOL="tcp" ;;
+    2) CHOSEN_TRANSPORT_PROTOCOL="kcp" ;;
+    3) CHOSEN_TRANSPORT_PROTOCOL="quic" ;;
+    4) CHOSEN_TRANSPORT_PROTOCOL="websocket" ;;
+    5) CHOSEN_TRANSPORT_PROTOCOL="wss" ;;
+    *) warn "Invalid choice; using tcp."; CHOSEN_TRANSPORT_PROTOCOL="tcp" ;;
+  esac
+  log "Transport protocol: $CHOSEN_TRANSPORT_PROTOCOL (this must be the same on the other server)."
 }
 
 install_packages() {
@@ -570,7 +615,7 @@ install_iran() {
   install_packages
   install_frp yes yes
   write_agent
-  local detected iran_ip peer_ip frp_token xtcp_secret
+  local detected iran_ip peer_ip frp_token xtcp_secret transport_protocol transport_bind_extra=""
   detected="$(curl -4fsS --connect-timeout 5 --max-time 8 https://api.ipify.org 2>/dev/null || true)"
   if ! valid_ipv4 "$detected"; then detected=""; fi
   read -rp "Public IPv4 of the Iran server${detected:+ [$detected]}: " iran_ip
@@ -578,12 +623,19 @@ install_iran() {
   valid_ipv4 "$iran_ip" || die "No valid public IPv4 was entered."
   read -rp "Public IPv4 of the outside server, to allow UDP if UFW is active (press Enter to skip): " peer_ip
   if [[ -n "$peer_ip" ]] && ! valid_ipv4 "$peer_ip"; then die "The outside server's IP is not valid."; fi
+  choose_transport_protocol
+  transport_protocol="$CHOSEN_TRANSPORT_PROTOCOL"
+  case "$transport_protocol" in
+    kcp) transport_bind_extra="kcpBindPort = $FRPS_PORT"$'\n' ;;
+    quic) transport_bind_extra="quicBindPort = $FRPS_PORT"$'\n' ;;
+  esac
   frp_token="$DEFAULT_FRP_TOKEN"
   xtcp_secret="$DEFAULT_XTCP_SECRET"
   printf 'iran\n' > "$CONF_DIR/role"
   printf '%s\n' "$iran_ip" > "$CONF_DIR/iran_public_ip"
   printf '%s\n' "$frp_token" > "$CONF_DIR/frp_token"
   printf '%s\n' "$xtcp_secret" > "$CONF_DIR/xtcp_secret"
+  printf '%s\n' "$transport_protocol" > "$CONF_DIR/transport_protocol"
   chmod 600 "$CONF_DIR"/*
   : > "$CONF_DIR/forwards.tsv"
   if [[ ! -f "$CONF_DIR/old_ip_forward" ]]; then sysctl -n net.ipv4.ip_forward > "$CONF_DIR/old_ip_forward"; fi
@@ -592,7 +644,7 @@ install_iran() {
   cat > "$CONF_DIR/frps.toml" <<EOF2
 bindAddr = "0.0.0.0"
 bindPort = $FRPS_PORT
-tcpmuxHTTPConnectPort = $TCPMUX_PORT
+${transport_bind_extra}tcpmuxHTTPConnectPort = $TCPMUX_PORT
 auth.method = "token"
 auth.token = "$frp_token"
 log.to = "$LOG_DIR/frps.log"
@@ -602,6 +654,7 @@ EOF2
   cat > "$CONF_DIR/frpc-iran.toml" <<EOF2
 serverAddr = "127.0.0.1"
 serverPort = $FRPS_PORT
+transport.protocol = "$transport_protocol"
 natHoleStunServer = "$NAT_HOLE_STUN_SERVER"
 auth.method = "token"
 auth.token = "$frp_token"
@@ -654,9 +707,21 @@ EOF2
   systemctl daemon-reload
   systemctl enable --now xtcp-tun-frps.service xtcp-tun-agent.service xtcp-tun-frpc-iran.service xtcp-tun-rules.service
   log "Iran-side install complete. Use this information to connect the outside server:"
-  printf '\n  Iran IP:        %s\n  FRP Token:      %s\n  XTCP SecretKey: %s\n\n' "$iran_ip" "$frp_token" "$xtcp_secret"
+  printf '\n  Iran IP:        %s\n  FRP Token:      %s\n  XTCP SecretKey: %s\n  Protocol:       %s\n\n' "$iran_ip" "$frp_token" "$xtcp_secret" "$transport_protocol"
   printf 'Also open inbound TCP ports %s (control), %s (tcp fallback) and %s (tcpmux fallback) in the Iran datacenter'"'"'s firewall panel - ideally restricted to the outside server'"'"'s IP.\n' "$FRPS_PORT" "$TCP_FALLBACK_PORT" "$TCPMUX_PORT"
-  printf 'Now run this same script on the outside server and choose option 2.\n'
+  printf 'Now run this same script on the outside server, choose option 2, and pick the same protocol (%s) when asked.\n' "$transport_protocol"
+
+  log "Waiting for the tunnel interface ($TUN_DEV) to come up..."
+  local tun_wait=0
+  until ip link show dev "$TUN_DEV" >/dev/null 2>&1; do
+    sleep 1
+    tun_wait=$((tun_wait + 1))
+    if (( tun_wait >= 20 )); then
+      warn "Tunnel interface $TUN_DEV is not up yet; add port forwards later from menu option 7 once it is (check option 3 for status)."
+      return 0
+    fi
+  done
+  prompt_initial_forwards
 }
 
 install_outside() {
@@ -665,19 +730,23 @@ install_outside() {
   install_packages
   install_frp yes no
   write_agent
-  local iran_ip frp_token xtcp_secret
+  local iran_ip frp_token xtcp_secret transport_protocol
   read -rp "Public IPv4 of the Iran server: " iran_ip
   valid_ipv4 "$iran_ip" || die "The Iran server's public IPv4 is not valid."
+  choose_transport_protocol
+  transport_protocol="$CHOSEN_TRANSPORT_PROTOCOL"
   frp_token="$DEFAULT_FRP_TOKEN"
   xtcp_secret="$DEFAULT_XTCP_SECRET"
   printf 'outside\n' > "$CONF_DIR/role"
   printf '%s\n' "$iran_ip" > "$CONF_DIR/iran_public_ip"
   printf '%s\n' "$frp_token" > "$CONF_DIR/frp_token"
   printf '%s\n' "$xtcp_secret" > "$CONF_DIR/xtcp_secret"
+  printf '%s\n' "$transport_protocol" > "$CONF_DIR/transport_protocol"
   chmod 600 "$CONF_DIR"/*
   cat > "$CONF_DIR/frpc-outside.toml" <<EOF2
 serverAddr = "$iran_ip"
 serverPort = $FRPS_PORT
+transport.protocol = "$transport_protocol"
 natHoleStunServer = "$NAT_HOLE_STUN_SERVER"
 auth.method = "token"
 auth.token = "$frp_token"
@@ -740,9 +809,12 @@ EOF2
   systemctl daemon-reload
   systemctl enable --now xtcp-tun-frpc-outside.service xtcp-tun-agent.service
   log "Outside-side install complete. Check the status after a few seconds."
-  printf 'Iran tunnel IP:    %s\nOutside tunnel IP: %s\n' "$IRAN_TUN_IP" "$OUTSIDE_TUN_IP"
+  printf 'Iran tunnel IP:    %s\nOutside tunnel IP: %s\nProtocol:          %s\n' "$IRAN_TUN_IP" "$OUTSIDE_TUN_IP" "$transport_protocol"
   printf 'Once XTCP NAT traversal succeeds, IP packets will pass through the %s interface.\n' "$TUN_DEV"
   printf 'Make sure TCP ports %s, %s and %s are open on the Iran server (datacenter firewall + ufw).\n' "$FRPS_PORT" "$TCP_FALLBACK_PORT" "$TCPMUX_PORT"
+  if [[ "$transport_protocol" != "tcp" ]]; then
+    warn "Double-check the Iran server was also installed with protocol=$transport_protocol (menu option 10 there shows it); a mismatch here is a common reason the tunnel never connects."
+  fi
 }
 
 ipt() { iptables -w "$@"; }
@@ -817,6 +889,9 @@ status_all() {
     return 0
   fi
   printf '\nRole: %s\n' "$(cat "$CONF_DIR/role")"
+  if [[ -f "$CONF_DIR/transport_protocol" ]]; then
+    printf 'Transport protocol: %s\n' "$(cat "$CONF_DIR/transport_protocol")"
+  fi
   printf '\n--- Tunnel interface IP ---\n'
   ip -4 addr show dev "$TUN_DEV" 2>/dev/null || true
   printf '\n--- Services ---\n'
@@ -864,6 +939,57 @@ _parse_port_entry() {
   valid_port "$listen" || { warn "Invalid listen port skipped: $listen"; return 1; }
   valid_port "$target" || { warn "Invalid target port skipped: $target"; return 1; }
   printf '%s %s\n' "$listen" "$target"
+}
+
+# Used automatically at the end of install_iran, right after the tunnel
+# interface comes up. Unlike add_forward(), nothing here ever calls
+# die(): a skip, a typo, or a failed apply should fall through to "you
+# can do this later from menu option 7" rather than aborting the install
+# that already succeeded.
+prompt_initial_forwards() {
+  local proto ports_input entry parsed listen target added=() line
+  printf '\n'
+  read -rp "Port(s) to forward through the tunnel now, comma-separated (e.g. 1080,443, or 1080:1081,443 for a different target port) - press Enter to skip and add later from menu option 7: " ports_input
+  [[ -n "$ports_input" ]] || { log "No ports entered; add forwards later from menu option 7."; return 0; }
+  read -rp "Protocol for these ports (tcp/udp) [tcp]: " proto
+  proto="${proto,,}"
+  proto="${proto:-tcp}"
+  if [[ "$proto" != tcp && "$proto" != udp ]]; then
+    warn "Protocol must be tcp or udp; skipped. Add forwards later from menu option 7."
+    return 0
+  fi
+  IFS=',' read -ra entries <<< "$ports_input"
+  for entry in "${entries[@]}"; do
+    parsed="$(_parse_port_entry "$entry")" || continue
+    listen="${parsed% *}"
+    target="${parsed#* }"
+    if [[ "$listen" == "$FRPS_PORT" ]]; then
+      warn "Port $FRPS_PORT is reserved for the FRP control channel; skipped."
+      continue
+    fi
+    if awk -v p="$proto" -v l="$listen" '$1==p && $2==l {found=1} END{exit !found}' "$CONF_DIR/forwards.tsv"; then
+      warn "A rule for $proto/$listen already exists; skipped."
+      continue
+    fi
+    printf '%s %s %s\n' "$proto" "$listen" "$target" >> "$CONF_DIR/forwards.tsv"
+    added+=("$proto $listen $target")
+  done
+  if [[ ${#added[@]} -eq 0 ]]; then
+    warn "No forwarding rules were added."
+    return 0
+  fi
+  if ! apply_rules; then
+    for line in "${added[@]}"; do
+      sed -i "\\|^$line\$|d" "$CONF_DIR/forwards.tsv"
+    done
+    warn "Applying the rules failed; the new entries were rolled back. Try again later from menu option 7."
+    return 0
+  fi
+  log "Added forwarding rule(s):"
+  for line in "${added[@]}"; do
+    printf '  %s\n' "$line"
+  done
+  warn "Because of SNAT, the outside service will see the source address as $IRAN_TUN_IP; the real client IP is not passed through."
 }
 
 add_forward() {
@@ -959,8 +1085,11 @@ list_forwards() {
 show_credentials() {
   require_root
   [[ -f "$CONF_DIR/role" && "$(cat "$CONF_DIR/role")" == iran ]] || die "Connection info is only stored on the Iran server."
-  printf '\nIran IP:        %s\nFRP Token:      %s\nXTCP SecretKey: %s\n\n' \
-    "$(cat "$CONF_DIR/iran_public_ip")" "$(cat "$CONF_DIR/frp_token")" "$(cat "$CONF_DIR/xtcp_secret")"
+  local proto
+  proto="$(cat "$CONF_DIR/transport_protocol" 2>/dev/null || true)"
+  proto="${proto:-tcp}"
+  printf '\nIran IP:        %s\nFRP Token:      %s\nXTCP SecretKey: %s\nProtocol:       %s\n\n' \
+    "$(cat "$CONF_DIR/iran_public_ip")" "$(cat "$CONF_DIR/frp_token")" "$(cat "$CONF_DIR/xtcp_secret")" "$proto"
 }
 
 show_logs() {
@@ -1023,7 +1152,7 @@ menu() {
     printf '4) Start services\n'
     printf '5) Stop services\n'
     printf '6) Restart services\n'
-    printf '7) Add port forward(s) (Iran only)\n'
+    printf '7) Add more port forward(s) (Iran only)\n'
     printf '8) Remove port forward(s) (Iran only)\n'
     printf '9) List port forwards\n'
     printf '10) Show outside-connection credentials (Iran only)\n'
