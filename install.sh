@@ -19,15 +19,6 @@
 #     to forward (comma-separated, e.g. "1080,443"), same as before.
 #     Pressing Enter there skips it and it can still be done later from
 #     option 7.
-#   - FRP binaries are now downloaded from the pdnczone/hashem-frp
-#     mirror (a fork of the official fatedier/frp repo) instead of
-#     fatedier/frp directly. Same version, same release-asset naming
-#     convention (frp_VERSION_linux_ARCH.tar.gz); only the GitHub
-#     owner/repo in the download URL changed.
-#   - IRAN_TUN_IP/OUTSIDE_TUN_IP changed to 10.1.0.10/10.1.0.20. Since
-#     these two addresses don't fit in a /30, the TUN interface prefix
-#     was widened to /27 everywhere it's set, so both ends land in the
-#     same subnet.
 #
 # Previous revision:
 #   - All user-facing text translated from Persian to English.
@@ -58,8 +49,8 @@ LOG_DIR="/var/log/xtcp-tun"
 MANAGER_PATH="/usr/local/sbin/xtcp-tun-manager"
 AGENT_PATH="$BASE_DIR/tun-agent.py"
 TUN_DEV="xtcp0"
-IRAN_TUN_IP="10.1.0.10"
-OUTSIDE_TUN_IP="10.1.0.20"
+IRAN_TUN_IP="10.0.0.1"
+OUTSIDE_TUN_IP="10.0.0.2"
 FRPS_PORT="7000"
 PIPE_SERVER_PORT="17000"
 PIPE_VISITOR_PORT="17001"
@@ -177,16 +168,11 @@ install_frp() {
   esac
   tmp="$(mktemp -d /tmp/xtcp-frp.XXXXXX)"
   archive="$tmp/frp.tar.gz"
-  # Mirror of fatedier/frp maintained for the Hashem Iran-tunneling
-  # toolkit (same version, same release-asset naming convention). Not
-  # the official upstream repo - if a release's asset names ever drift
-  # from frp_VERSION_linux_ARCH.tar.gz, check the mirror's own releases
-  # page and update this URL accordingly.
-  url="https://github.com/pdnczone/hashem-frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_${arch}.tar.gz"
-  log "Downloading FRP ${FRP_VERSION} for Linux/${arch} from the pdnczone/hashem-frp mirror..."
+  url="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_${arch}.tar.gz"
+  log "Downloading FRP ${FRP_VERSION} for Linux/${arch} from the official repository..."
   if ! curl -fL --retry 3 --connect-timeout 15 --max-time 240 "$url" -o "$archive"; then
     rm -rf "$tmp"
-    die "FRP download failed. Check HTTPS access to GitHub, that this architecture is available, and that the asset name on https://github.com/pdnczone/hashem-frp/releases/tag/v${FRP_VERSION} still matches frp_${FRP_VERSION}_linux_${arch}.tar.gz."
+    die "FRP download failed. Check HTTPS access to GitHub and that this architecture is available."
   fi
   tar -tzf "$archive" >/dev/null || { rm -rf "$tmp"; die "The downloaded FRP archive is not a valid tarball."; }
   tar -xzf "$archive" -C "$tmp"
@@ -433,12 +419,12 @@ def main():
     subs = parser.add_subparsers(dest="mode", required=True)
     server = subs.add_parser("server")
     server.add_argument("--dev", default="xtcp0")
-    server.add_argument("--cidr", default="10.1.0.10/27")
+    server.add_argument("--cidr", default="10.0.0.1/30")
     server.add_argument("--listen", default="127.0.0.1:17000")
     server.add_argument("--mtu", type=int, default=1280)
     client = subs.add_parser("client")
     client.add_argument("--dev", default="xtcp0")
-    client.add_argument("--cidr", default="10.1.0.20/27")
+    client.add_argument("--cidr", default="10.0.0.2/30")
     client.add_argument("--connect", default="127.0.0.1:17001")
     client.add_argument("--direct-tcp", default=None,
                          help="HOST:PORT of a plain 'tcp' type frp proxy, tried if the local FRP visitor fails")
@@ -537,7 +523,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=notify
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 $AGENT_PATH server --dev $TUN_DEV --cidr $IRAN_TUN_IP/27 --listen 127.0.0.1:$PIPE_SERVER_PORT --mtu $MTU
+ExecStart=/usr/bin/python3 $AGENT_PATH server --dev $TUN_DEV --cidr $IRAN_TUN_IP/30 --listen 127.0.0.1:$PIPE_SERVER_PORT --mtu $MTU
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -594,7 +580,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=notify
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 $AGENT_PATH client --dev $TUN_DEV --cidr $OUTSIDE_TUN_IP/27 --connect 127.0.0.1:$PIPE_VISITOR_PORT --direct-tcp $iran_ip:$TCP_FALLBACK_PORT --tcpmux $iran_ip:$TCPMUX_PORT --tcpmux-host $TCPMUX_DOMAIN --mtu $MTU
+ExecStart=/usr/bin/python3 $AGENT_PATH client --dev $TUN_DEV --cidr $OUTSIDE_TUN_IP/30 --connect 127.0.0.1:$PIPE_VISITOR_PORT --direct-tcp $iran_ip:$TCP_FALLBACK_PORT --tcpmux $iran_ip:$TCPMUX_PORT --tcpmux-host $TCPMUX_DOMAIN --mtu $MTU
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
