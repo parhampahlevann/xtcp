@@ -1,10 +1,43 @@
 #!/usr/bin/env bash
 # XTCP-TUN Manager: IPv4 TUN-over-FRP-XTCP for Ubuntu/Debian
 #
-# Changes in this revision:
+# Changes in this revision (bug-fix / robustness pass):
+#   - Port-forward reservation now also covers the TCP fallback port
+#     ($TCP_FALLBACK_PORT) and the TCPMUX port ($TCPMUX_PORT), not just
+#     the FRP control port ($FRPS_PORT). Forwarding a user port onto
+#     either of those silently hijacked traffic away from frps's own
+#     fallback listeners before it ever reached them - DNAT in the nat
+#     table's PREROUTING chain runs before the local-delivery decision,
+#     so it intercepts packets addressed to frps's own ports too, not
+#     just "foreign" traffic. add_forward() and prompt_initial_forwards()
+#     now refuse all three reserved ports, and apply_rules() itself skips
+#     (and warns about) any stale forwards.tsv entry that targets one, in
+#     case it predates this fix.
+#   - add_forward()/prompt_initial_forwards() now detect sshd's own
+#     listening port(s) (via `ss`, falling back to 22 if that's not
+#     possible) and require typed confirmation before forwarding onto
+#     one of them, since that would silently steal the admin's own SSH
+#     access to this box the next time the rules are applied.
+#   - setup_ufw_iran()'s "is the control port already allowed" check, and
+#     the rule it adds, were hardcoded to the literal "7000/tcp" instead
+#     of using $FRPS_PORT, so both would quietly stop matching reality if
+#     FRPS_PORT were ever changed from its default.
+#   - remove_forward() now backs up forwards.tsv and rolls it back if
+#     apply_rules() fails, the same way add_forward() already did,
+#     instead of leaving the saved config and the live iptables rules
+#     out of sync with no rollback and no clear explanation.
+#   - make_outside_units() now takes iran_ip as an explicit argument
+#     instead of silently relying on it being a `local` variable in
+#     whatever function happened to call it. That worked (bash's dynamic
+#     scoping makes a caller's `local` visible to whatever it calls), but
+#     it was fragile and non-obvious, so it's now explicit.
+#   - The TUN agent's systemd units now invoke the python3 binary
+#     resolved once at install time (via `command -v python3`) instead
+#     of a hardcoded /usr/bin/python3, and both gained
+#     NoNewPrivileges=true to match the frps/frpc units' hardening.
 #   - FRP pinned to v0.61.1 (was v0.71.1): the older release has been more
 #     stable for this use case.
-#   - Both installs (Iran and outside) now ask which transport protocol
+#   - Both installs (Iran and outside) ask which transport protocol
 #     frpc should use to reach frps: tcp (default - just press Enter),
 #     kcp, quic, websocket (ws) or wss. This is FRP's own
 #     transport.protocol setting for the frpc<->frps control connection,
@@ -55,6 +88,15 @@ FRPS_PORT="7000"
 PIPE_SERVER_PORT="17000"
 PIPE_VISITOR_PORT="17001"
 MTU="1280"
+# Fixed TCP MSS clamp for forwarded connections that cross the tunnel
+# (set on the Iran side in apply_rules()). 1280 (MTU) - 40 (IPv4 + TCP
+# header overhead) = 1240. A fixed --set-mss is used instead of
+# --clamp-mss-to-pmtu: the latter relies on ICMP "fragmentation needed"
+# messages for path-MTU discovery, and those are exactly the kind of
+# packets a restrictive network is prone to dropping, which can make
+# clamp-to-pmtu silently fail to clamp at all. A fixed value sidesteps
+# that by rewriting the MSS option directly, with no ICMP involved.
+TUNNEL_MSS="1240"
 
 # Fixed shared credentials: used on both the Iran side (generated into
 # frps/frpc-iran config) and the outside side (no longer prompted for),
@@ -96,6 +138,11 @@ XTCP_FALLBACK_TIMEOUT_MS="1500"
 # The installer restricts both to the outside server's IP via ufw when
 # that IP is given; without it they're left open to the internet - still
 # worth locking down by hand (ufw/iptables/cloud firewall) to that IP.
+# Also note: unlike the xtcp/stcp path, these two fallbacks carry the
+# tunneled IP packets without any frp-level payload encryption of their
+# own (the public-facing leg here is a raw socket the Python agent dials
+# directly, bypassing frpc's encrypted work-connection machinery) - treat
+# them as a connectivity-of-last-resort path, not a confidential one.
 TCP_FALLBACK_PORT="17002"
 TCPMUX_PORT="8443"
 TCPMUX_DOMAIN="xtcp-l3"
@@ -116,6 +163,54 @@ PY
 }
 valid_port() {
   [[ "${1:-}" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+# True (exit 0) if $1 is one of the ports this script's own control or
+# fallback channels need for itself: the FRP control port and the two
+# outside-agent fallback ports. A user-added forward is never allowed to
+# target one of these - DNAT in the nat table's PREROUTING chain runs
+# before the local-delivery decision, so it would divert traffic away
+# from frps's own listener on that port before frps (or frpc) ever saw
+# it, silently breaking that channel with no obvious error.
+is_reserved_port() {
+  case "${1:-}" in
+    "$FRPS_PORT"|"$TCP_FALLBACK_PORT"|"$TCPMUX_PORT") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Best-effort detection of the port(s) sshd is actually listening on, used
+# to warn before a forward would silently steal the admin's own SSH
+# access to this box. Falls back to the conventional port 22 if sshd
+# can't be found this way (ss missing, sshd not running as "sshd", etc.).
+detect_ssh_ports() {
+  local ports
+  ports="$(ss -Htlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -u)"
+  if [[ -z "$ports" ]]; then
+    printf '22\n'
+  else
+    printf '%s\n' "$ports"
+  fi
+}
+
+# If $1 is (as far as we can tell) sshd's own listening port, warns and
+# requires the user to type YES to proceed anyway. Returns 1 (caller
+# should skip this port) if they don't confirm; returns 0 immediately if
+# the port doesn't look like an SSH port. Never calls die() - callers
+# decide whether a "no" here is fatal for the whole action or just skips
+# this one port.
+confirm_not_ssh_port() {
+  local listen="$1" ssh_ports p confirm
+  ssh_ports="$(detect_ssh_ports)"
+  for p in $ssh_ports; do
+    if [[ "$listen" == "$p" ]]; then
+      warn "Port $listen looks like sshd's own listening port on this server. Forwarding it through the tunnel will silently steal new SSH connections away from this box the next time the rules are applied - you could lock yourself out."
+      read -rp "Type YES to forward it anyway, or press Enter to skip this port: " confirm
+      [[ "$confirm" == "YES" ]] || return 1
+      break
+    fi
+  done
+  return 0
 }
 
 # Prompts for which protocol frpc should use to reach frps (FRP's own
@@ -156,6 +251,13 @@ install_packages() {
   self_path="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
   [[ -f "$self_path" ]] || die "Could not find the script file; save xtcp-tun-manager.sh on the server first, then run it with bash."
   install -m 0755 "$self_path" "$MANAGER_PATH"
+  # Resolved once here (not hardcoded as /usr/bin/python3) so the agent's
+  # systemd units keep working even on a system where python3 isn't at
+  # that exact path. This is a plain (non-local) assignment so it's still
+  # visible later in make_iran_units()/make_outside_units(), the same way
+  # choose_transport_protocol() hands back CHOSEN_TRANSPORT_PROTOCOL.
+  PYTHON_BIN="$(command -v python3)"
+  [[ -n "$PYTHON_BIN" ]] || die "python3 was installed but could not be found on PATH."
 }
 
 install_frp() {
@@ -462,12 +564,12 @@ PY
 
 setup_ufw_iran() {
   local peer_ip="${1:-}"
-  [[ -x "$(command -v ufw 2>/dev/null || true)" ]] || return 0
+  command -v ufw >/dev/null 2>&1 || return 0
   ufw status 2>/dev/null | head -n 1 | grep -qi 'Status: active' || return 0
-  if ! ufw status 2>/dev/null | grep -Eq '(^|[[:space:]])7000/tcp.*ALLOW'; then
-    ufw allow 7000/tcp comment 'xtcp-tun-managed' >/dev/null
-    printf 'yes\n' > "$CONF_DIR/ufw_added_tcp7000"
-    log "UFW: allowed TCP/7000 for the FRP control connection."
+  if ! ufw status 2>/dev/null | grep -Eq "(^|[[:space:]])${FRPS_PORT}/tcp.*ALLOW"; then
+    ufw allow "${FRPS_PORT}/tcp" comment 'xtcp-tun-managed' >/dev/null
+    printf 'yes\n' > "$CONF_DIR/ufw_added_tcp_control"
+    log "UFW: allowed TCP/$FRPS_PORT for the FRP control connection."
   fi
   if [[ -n "$peer_ip" ]] && valid_ipv4 "$peer_ip"; then
     if ! ufw status 2>/dev/null | grep -F "$peer_ip" | grep -q 'ALLOW'; then
@@ -484,7 +586,7 @@ setup_ufw_iran() {
 
 setup_ufw_outside() {
   local iran_ip="$1"
-  [[ -x "$(command -v ufw 2>/dev/null || true)" ]] || return 0
+  command -v ufw >/dev/null 2>&1 || return 0
   ufw status 2>/dev/null | head -n 1 | grep -qi 'Status: active' || return 0
   if ! ufw status 2>/dev/null | grep -F "$iran_ip" | grep -q 'ALLOW'; then
     ufw allow from "$iran_ip" to any proto udp comment 'xtcp-tun-managed' >/dev/null
@@ -523,10 +625,11 @@ StartLimitIntervalSec=0
 [Service]
 Type=notify
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 $AGENT_PATH server --dev $TUN_DEV --cidr $IRAN_TUN_IP/30 --listen 127.0.0.1:$PIPE_SERVER_PORT --mtu $MTU
+ExecStart=$PYTHON_BIN $AGENT_PATH server --dev $TUN_DEV --cidr $IRAN_TUN_IP/30 --listen 127.0.0.1:$PIPE_SERVER_PORT --mtu $MTU
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
@@ -570,6 +673,7 @@ EOF2
 }
 
 make_outside_units() {
+  local iran_ip="$1"
   cat > /etc/systemd/system/xtcp-tun-agent.service <<EOF2
 [Unit]
 Description=IPv4 TUN packet bridge over FRP XTCP (outside side)
@@ -580,10 +684,11 @@ StartLimitIntervalSec=0
 [Service]
 Type=notify
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 $AGENT_PATH client --dev $TUN_DEV --cidr $OUTSIDE_TUN_IP/30 --connect 127.0.0.1:$PIPE_VISITOR_PORT --direct-tcp $iran_ip:$TCP_FALLBACK_PORT --tcpmux $iran_ip:$TCPMUX_PORT --tcpmux-host $TCPMUX_DOMAIN --mtu $MTU
+ExecStart=$PYTHON_BIN $AGENT_PATH client --dev $TUN_DEV --cidr $OUTSIDE_TUN_IP/30 --connect 127.0.0.1:$PIPE_VISITOR_PORT --direct-tcp $iran_ip:$TCP_FALLBACK_PORT --tcpmux $iran_ip:$TCPMUX_PORT --tcpmux-host $TCPMUX_DOMAIN --mtu $MTU
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
@@ -682,7 +787,9 @@ localPort = $PIPE_SERVER_PORT
 # Direct public-port fallback, reachable without going through frpc's own
 # control connection at all (see run_client's --direct-tcp on the outside
 # agent). No secretKey gating - restricted to the outside server's IP via
-# ufw by setup_ufw_iran when that IP is known.
+# ufw by setup_ufw_iran when that IP is known. This leg also carries the
+# tunneled packets without any frp-level payload encryption (see the
+# TCP_FALLBACK_PORT/TCPMUX_PORT comment near the top of this script).
 [[proxies]]
 name = "xtcp-l3-tcp"
 type = "tcp"
@@ -692,7 +799,8 @@ remotePort = $TCP_FALLBACK_PORT
 
 # Same idea, but reached via an HTTP CONNECT request to frps's tcpmux
 # port, so on the wire it looks like ordinary HTTPS forward-proxy traffic.
-# No secretKey gating here either - same ufw restriction as above applies.
+# No secretKey gating here either - same ufw restriction as above applies,
+# and the same "no frp-level payload encryption" caveat applies too.
 [[proxies]]
 name = "xtcp-l3-tcpmux"
 type = "tcpmux"
@@ -804,7 +912,7 @@ secretKey = "$xtcp_secret"
 bindPort = -1
 EOF2
   chmod 600 "$CONF_DIR"/*.toml
-  make_outside_units
+  make_outside_units "$iran_ip"
   setup_ufw_outside "$iran_ip"
   systemctl daemon-reload
   systemctl enable --now xtcp-tun-frpc-outside.service xtcp-tun-agent.service
@@ -841,10 +949,10 @@ apply_rules() {
   ipt -t nat -C POSTROUTING -o "$TUN_DEV" -j XTCP_TUN_SNAT 2>/dev/null || ipt -t nat -I POSTROUTING 1 -o "$TUN_DEV" -j XTCP_TUN_SNAT
   ipt -C FORWARD -j XTCP_TUN_FWD 2>/dev/null || ipt -I FORWARD 1 -j XTCP_TUN_FWD
   ipt -t mangle -C FORWARD -j XTCP_TUN_MSS 2>/dev/null || ipt -t mangle -I FORWARD 1 -j XTCP_TUN_MSS
-  if ! ipt -t mangle -A XTCP_TUN_MSS -o "$TUN_DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; then
+  if ! ipt -t mangle -A XTCP_TUN_MSS -o "$TUN_DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TUNNEL_MSS"; then
     warn "Could not add TCP MSS clamp for outbound tunnel traffic; if some sites fail to load, check MTU/MSS."
   fi
-  if ! ipt -t mangle -A XTCP_TUN_MSS -i "$TUN_DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; then
+  if ! ipt -t mangle -A XTCP_TUN_MSS -i "$TUN_DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TUNNEL_MSS"; then
     warn "Could not add TCP MSS clamp for inbound tunnel traffic; if some sites fail to load, check MTU/MSS."
   fi
   ipt -t mangle -A XTCP_TUN_MSS -j RETURN
@@ -858,12 +966,21 @@ apply_rules() {
       warn "Skipping forward for port $FRPS_PORT: reserved for the FRP control channel."
       continue
     fi
+    # Defense in depth: also refuse the two outside-agent fallback ports
+    # here, in case forwards.tsv has a stale entry from before this check
+    # existed in add_forward()/prompt_initial_forwards(). DNAT runs before
+    # local delivery, so a forward on either of these would silently
+    # divert traffic away from frps's own fallback listeners.
+    if is_reserved_port "$listen"; then
+      warn "Skipping forward for port $listen: reserved for this script's own control/fallback channels (FRP control: $FRPS_PORT, TCP fallback: $TCP_FALLBACK_PORT, TCPMUX fallback: $TCPMUX_PORT)."
+      continue
+    fi
     ipt -t nat -A XTCP_TUN_DNAT -i "$wan" -p "$proto" --dport "$listen" -j DNAT --to-destination "$OUTSIDE_TUN_IP:$target"
     ipt -t nat -A XTCP_TUN_SNAT -d "$OUTSIDE_TUN_IP" -p "$proto" --dport "$target" -j SNAT --to-source "$IRAN_TUN_IP"
     ipt -A XTCP_TUN_FWD -i "$wan" -o "$TUN_DEV" -d "$OUTSIDE_TUN_IP" -p "$proto" --dport "$target" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
   done < "$CONF_DIR/forwards.tsv"
   ipt -A XTCP_TUN_FWD -j RETURN
-  log "Rules applied. WAN=$wan; DNAT targets $OUTSIDE_TUN_IP and replies are SNATed from $IRAN_TUN_IP."
+  log "Rules applied. WAN=$wan; DNAT targets $OUTSIDE_TUN_IP and replies are SNATed from $IRAN_TUN_IP; TCP MSS fixed at $TUNNEL_MSS for tunnel traffic."
 }
 
 remove_iptables_rules() {
@@ -963,10 +1080,11 @@ prompt_initial_forwards() {
     parsed="$(_parse_port_entry "$entry")" || continue
     listen="${parsed% *}"
     target="${parsed#* }"
-    if [[ "$listen" == "$FRPS_PORT" ]]; then
-      warn "Port $FRPS_PORT is reserved for the FRP control channel; skipped."
+    if is_reserved_port "$listen"; then
+      warn "Port $listen is reserved for this script's own control/fallback channels (FRP control: $FRPS_PORT, TCP fallback: $TCP_FALLBACK_PORT, TCPMUX fallback: $TCPMUX_PORT); skipped."
       continue
     fi
+    confirm_not_ssh_port "$listen" || { warn "Skipped port $listen."; continue; }
     if awk -v p="$proto" -v l="$listen" '$1==p && $2==l {found=1} END{exit !found}' "$CONF_DIR/forwards.tsv"; then
       warn "A rule for $proto/$listen already exists; skipped."
       continue
@@ -1006,10 +1124,11 @@ add_forward() {
     parsed="$(_parse_port_entry "$entry")" || continue
     listen="${parsed% *}"
     target="${parsed#* }"
-    if [[ "$listen" == "$FRPS_PORT" ]]; then
-      warn "Port $FRPS_PORT is reserved for the FRP control channel; skipped."
+    if is_reserved_port "$listen"; then
+      warn "Port $listen is reserved for this script's own control/fallback channels (FRP control: $FRPS_PORT, TCP fallback: $TCP_FALLBACK_PORT, TCPMUX fallback: $TCPMUX_PORT); skipped."
       continue
     fi
+    confirm_not_ssh_port "$listen" || { warn "Skipped port $listen."; continue; }
     if awk -v p="$proto" -v l="$listen" '$1==p && $2==l {found=1} END{exit !found}' "$CONF_DIR/forwards.tsv"; then
       warn "A rule for $proto/$listen already exists; skipped."
       continue
@@ -1037,13 +1156,15 @@ add_forward() {
 remove_forward() {
   require_root
   [[ -f "$CONF_DIR/role" && "$(cat "$CONF_DIR/role")" == iran ]] || die "Removing a forward is only done on the Iran server."
-  local proto ports_input entry listen tmp removed=() notfound=()
+  local proto ports_input entry listen tmp backup removed=() notfound=()
   read -rp "Protocol (tcp/udp): " proto
   proto="${proto,,}"
   [[ "$proto" == tcp || "$proto" == udp ]] || die "Protocol must be tcp or udp."
   read -rp "Listen port(s) to remove, comma-separated (e.g. 1080,443): " ports_input
   [[ -n "$ports_input" ]] || die "No ports entered."
   IFS=',' read -ra entries <<< "$ports_input"
+  backup="$(mktemp)"
+  cp "$CONF_DIR/forwards.tsv" "$backup"
   tmp="$(mktemp)"
   cp "$CONF_DIR/forwards.tsv" "$tmp"
   for entry in "${entries[@]}"; do
@@ -1058,12 +1179,21 @@ remove_forward() {
     fi
   done
   if [[ ${#removed[@]} -eq 0 ]]; then
-    rm -f "$tmp"
+    rm -f "$tmp" "$backup"
     die "No matching rule(s) were found to remove."
   fi
   cat "$tmp" > "$CONF_DIR/forwards.tsv"
   rm -f "$tmp"
-  apply_rules
+  # Same rollback-on-failure discipline as add_forward(): either the
+  # config change and the live iptables rules move together, or neither
+  # does, so forwards.tsv never silently drifts out of sync with what's
+  # actually applied.
+  if ! apply_rules; then
+    cat "$backup" > "$CONF_DIR/forwards.tsv"
+    rm -f "$backup"
+    die "Applying the rules failed; the removal was rolled back and the previous rules are still in place."
+  fi
+  rm -f "$backup"
   log "Removed: ${removed[*]}"
   [[ ${#notfound[@]} -eq 0 ]] || warn "Not found (skipped): ${notfound[*]}"
 }
@@ -1113,8 +1243,8 @@ uninstall_all() {
   [[ "$confirm" == DELETE ]] || { log "Cancelled."; return 0; }
   remove_iptables_rules
   systemctl disable --now xtcp-tun-rules.service xtcp-tun-frpc-iran.service xtcp-tun-frpc-outside.service xtcp-tun-agent.service xtcp-tun-frps.service >/dev/null 2>&1 || true
-  if [[ -f "$CONF_DIR/ufw_added_tcp7000" ]] && command -v ufw >/dev/null 2>&1; then
-    ufw --force delete allow 7000/tcp >/dev/null 2>&1 || true
+  if [[ -f "$CONF_DIR/ufw_added_tcp_control" ]] && command -v ufw >/dev/null 2>&1; then
+    ufw --force delete allow "${FRPS_PORT}/tcp" >/dev/null 2>&1 || true
   fi
   if [[ -f "$CONF_DIR/ufw_added_udp_peer" ]] && command -v ufw >/dev/null 2>&1; then
     peer="$(cat "$CONF_DIR/ufw_added_udp_peer" 2>/dev/null || true)"
