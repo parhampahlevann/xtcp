@@ -1,7 +1,42 @@
 #!/usr/bin/env bash
 # XTCP-TUN Manager: IPv4 TUN-over-FRP-XTCP for Ubuntu/Debian
 #
-# Changes in this revision (remaining default ports moved too):
+# Changes in this revision (fix: "Interface xtcp0 does not exist" / TUN
+# interface creation):
+#   - apply_rules() previously did a single, immediate
+#     `ip link show dev $TUN_DEV` and died right away if the interface
+#     wasn't there yet ("Interface xtcp0 does not exist; start the
+#     XTCP-TUN service first."). apply_rules() is reached not only from
+#     xtcp-tun-rules.service at boot (which is already ordered after
+#     xtcp-tun-agent.service, the unit that creates the interface) but
+#     also directly from the interactive menu - option 1 right after
+#     install, and options 7/8 (add/remove forward) at any later time -
+#     where no such ordering exists. A new wait_for_tun_interface()
+#     gives it up to 15s for the interface to appear before failing, and
+#     the die() message it now shows is far more actionable: it checks
+#     whether /dev/net/tun itself is missing (the most common real cause
+#     - TUN unavailable on some virtualized/container hosts) and points
+#     at `systemctl status xtcp-tun-agent.service` and menu option 11
+#     (logs), instead of just repeating "start the service first" with
+#     no next step.
+#   - install_packages() now calls a new ensure_tun_device(): it loads
+#     the tun kernel module (`modprobe tun`, best-effort) and, if
+#     /dev/net/tun is still missing, tries creating the device node
+#     directly (`mknod /dev/net/tun c 10 200`) - the standard workaround
+#     on some container-based VPS (e.g. OpenVZ) where the node can be
+#     absent even though the module itself is fine. If it's still
+#     missing after that, install now warns clearly at install time
+#     (rather than only surfacing as the opaque error above later) that
+#     TUN/TAP support may need to be enabled by the hosting provider for
+#     this specific server/container. Runs on both the Iran and the
+#     outside install, since tun-agent.py opens a TUN device on both
+#     sides.
+#   - status_all() (menu option 3) now also reports whether
+#     /dev/net/tun exists, right next to the tunnel-interface line, so a
+#     missing-TUN-device problem (the likely cause if the interface
+#     never comes up) is visible from status instead of only from logs.
+#
+# Previous revision (remaining default ports moved too):
 #   - The install-time preflight check (port_listening(), previous
 #     revision) caught a second collision on this box: TCP_FALLBACK_PORT
 #     17002 was also already held by another process (this check tests
@@ -242,6 +277,27 @@ port_listening() {
   ss -Htln "( sport = :$1 )" 2>/dev/null | grep -q .
 }
 
+# True (exit 0) once $TUN_DEV exists, waiting up to ~15s for it to appear
+# first instead of failing on the spot. apply_rules() - which uses this -
+# is reached both from xtcp-tun-rules.service (already ordered after
+# xtcp-tun-agent.service, the Type=notify unit that actually creates the
+# interface in open_tun() before it reports ready) and directly from the
+# interactive menu (install, or add/remove forward later), where no such
+# systemd ordering exists. A short bounded wait absorbs ordinary startup
+# timing without masking a real, lasting problem - TUN unavailable, or
+# the agent failing to start at all - which still surfaces as a clear
+# failure once the wait is exhausted (see the die() message in
+# apply_rules()).
+wait_for_tun_interface() {
+  local tries=0
+  until ip link show dev "$TUN_DEV" >/dev/null 2>&1; do
+    (( tries < 15 )) || return 1
+    sleep 1
+    tries=$((tries + 1))
+  done
+  return 0
+}
+
 # Best-effort detection of the port(s) sshd is actually listening on, used
 # to warn before a forward would silently steal the admin's own SSH
 # access to this box. Falls back to the conventional port 22 if sshd
@@ -302,6 +358,28 @@ choose_transport_protocol() {
   log "Transport protocol: $CHOSEN_TRANSPORT_PROTOCOL (this must be the same on the other server)."
 }
 
+
+# Best-effort: makes sure the TUN kernel module is loaded and /dev/net/tun
+# exists before any service is started. The single most common real cause
+# behind "Interface $TUN_DEV does not exist" (see wait_for_tun_interface(),
+# used by apply_rules()) is that TUN itself isn't available on this host -
+# common on some budget VPS/container virtualization (e.g. OpenVZ), where
+# the device node can be missing even if the kernel module is fine, and
+# where full TUN access sometimes has to be enabled by the hosting
+# provider for this specific container - something this script cannot do
+# on its own. Runs for both roles: tun-agent.py opens a TUN device on the
+# Iran side (server mode) and the outside side (client mode) alike.
+ensure_tun_device() {
+  command -v modprobe >/dev/null 2>&1 && modprobe tun >/dev/null 2>&1
+  if [[ ! -e /dev/net/tun ]]; then
+    mkdir -p /dev/net 2>/dev/null || true
+    mknod -m 600 /dev/net/tun c 10 200 2>/dev/null || true
+  fi
+  if [[ ! -e /dev/net/tun ]]; then
+    warn "/dev/net/tun is still missing after trying to load the tun module and create the device node. If this server is a container (OpenVZ/LXC/etc.), TUN/TAP support usually has to be enabled by the hosting provider for this specific container - that is outside what this script can do from inside it. Install will continue, but the tunnel interface will not come up until this is resolved; check menu option 11 (logs) for the agent's exact error, and option 3 (status) for whether /dev/net/tun exists."
+  fi
+}
+
 install_packages() {
   command -v apt-get >/dev/null 2>&1 || die "This version currently targets Ubuntu/Debian only."
   log "Checking and installing required dependencies (no apt update/upgrade)..."
@@ -310,6 +388,7 @@ install_packages() {
   mkdir -p "$BASE_DIR" "$CONF_DIR" "$LOG_DIR"
   chmod 700 "$CONF_DIR"
   chmod 755 "$BASE_DIR" "$LOG_DIR"
+  ensure_tun_device
   local self_path
   self_path="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
   [[ -f "$self_path" ]] || die "Could not find the script file; save xtcp-tun-manager.sh on the server first, then run it with bash."
@@ -1042,7 +1121,11 @@ apply_rules() {
   require_root
   [[ -f "$CONF_DIR/role" && "$(cat "$CONF_DIR/role")" == iran ]] || { log "Forwarding rules only apply on the Iran role."; return 0; }
   command -v iptables >/dev/null 2>&1 || die "iptables is not installed."
-  ip link show dev "$TUN_DEV" >/dev/null 2>&1 || die "Interface $TUN_DEV does not exist; start the XTCP-TUN service first."
+  if ! wait_for_tun_interface; then
+    local tun_hint=""
+    [[ -e /dev/net/tun ]] || tun_hint=" /dev/net/tun does not exist on this system - TUN is unavailable here (common on some virtualized/container hosts, which may need this enabled by the hosting provider; see the warning at install time)."
+    die "Interface $TUN_DEV still does not exist after waiting 15s.${tun_hint} Check: systemctl status xtcp-tun-agent.service, and menu option 11 (logs) for the agent's own error - it logs straight to journald, not a file."
+  fi
   local wan
   wan="$(ip -4 route show default | awk 'NR==1 {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
   [[ -n "$wan" ]] || wan="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
@@ -1121,7 +1204,10 @@ status_all() {
     printf 'Transport protocol: %s\n' "$(cat "$CONF_DIR/transport_protocol")"
   fi
   printf '\n--- Tunnel interface IP ---\n'
-  ip -4 addr show dev "$TUN_DEV" 2>/dev/null || true
+  if ! ip -4 addr show dev "$TUN_DEV" 2>/dev/null; then
+    printf '  Interface %s does not exist yet.\n' "$TUN_DEV"
+    [[ -e /dev/net/tun ]] || printf '  /dev/net/tun does not exist on this system - TUN is unavailable, which is why the interface cannot be created (try: modprobe tun; if that does not help, this may need to be enabled by the hosting provider).\n'
+  fi
   printf '\n--- Services ---\n'
   local s
   for s in xtcp-tun-frps xtcp-tun-agent xtcp-tun-frpc-iran xtcp-tun-frpc-outside xtcp-tun-rules; do
