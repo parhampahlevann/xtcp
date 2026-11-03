@@ -1,31 +1,29 @@
 #!/usr/bin/env bash
 # XTCP-TUN Manager: IPv4 TUN-over-FRP-XTCP for Ubuntu/Debian
 #
-# Changes in this revision (default control port moved):
-#   - FRPS_PORT moved from 7000 to 47000: on this user's Iran server,
-#     port 7000 (frp's own conventional default) was already held by
-#     another, unrelated service - almost certainly another already-
-#     installed FRP-based tunnel script, since frp defaults to 7000
-#     unless a script explicitly overrides it. The install-time
-#     preflight check added in the previous revision (still in place,
-#     see port_listening()) confirmed this directly rather than it
-#     showing up as a mysterious "connection refused" from frpc.
-#     47000 is outside the common-service / common-tunnel-tool range
-#     and was not reported as conflicting, but it is still checked at
-#     install time like any other port - if it or TCP_FALLBACK_PORT
-#     (17002) or TCPMUX_PORT (8443) ever turn out to collide with
-#     something else on a given box, change them here, at the top of
-#     the script, and reinstall; nothing else needs to change, since
-#     every other part of the script (configs, systemd units, ufw
-#     rules, menu text) reads these constants rather than hardcoding
-#     the port number anywhere.
-#   - Because the control port is baked into both sides' configs
-#     (frps.toml on Iran, frpc-outside.toml on the outside server),
-#     this updated script needs to be reinstalled on BOTH servers, not
-#     just the Iran one - a stale outside install would still try to
-#     dial the old port 7000 and fail the same way as before.
+# Changes in this revision (remaining default ports moved too):
+#   - The install-time preflight check (port_listening(), previous
+#     revision) caught a second collision on this box: TCP_FALLBACK_PORT
+#     17002 was also already held by another process (this check tests
+#     FRPS_PORT, TCP_FALLBACK_PORT and TCPMUX_PORT in order and stops at
+#     the first conflict, so TCPMUX_PORT 8443 was never actually tested
+#     yet - it may or may not have been free). Rather than risk a third
+#     round of this, both TCP_FALLBACK_PORT and TCPMUX_PORT are moved
+#     off their old defaults (17002, 8443 - the latter a fairly common
+#     choice for other tools' TLS/admin ports too) to 47001/47002,
+#     grouped right next to FRPS_PORT (47000) in a range nothing else on
+#     this particular box has been shown to use. As before, the
+#     preflight check still runs on every install, so if any of the
+#     three ever collides again on a given box it fails loudly and
+#     immediately, with the exact port named, instead of silently
+#     crash-looping.
+#   - Same reinstall note as before: these values are baked into both
+#     sides' configs at install time, so the updated script needs to be
+#     reinstalled on BOTH the Iran and the outside server, and the
+#     Iran datacenter firewall panel needs 47000-47002/tcp open instead
+#     of the old 7000/17002/8443.
 #
-# Previous revision (frps startup robustness):
+# Previous revision (default control port moved):
 #   - install_iran() now checks, before doing anything else, whether
 #     $FRPS_PORT, $TCP_FALLBACK_PORT or $TCPMUX_PORT are already bound
 #     by some other process on the box, and refuses to install if so.
@@ -195,8 +193,8 @@ XTCP_FALLBACK_TIMEOUT_MS="1500"
 # own (the public-facing leg here is a raw socket the Python agent dials
 # directly, bypassing frpc's encrypted work-connection machinery) - treat
 # them as a connectivity-of-last-resort path, not a confidential one.
-TCP_FALLBACK_PORT="17002"
-TCPMUX_PORT="8443"
+TCP_FALLBACK_PORT="47001"
+TCPMUX_PORT="47002"
 TCPMUX_DOMAIN="xtcp-l3"
 
 log() { printf '\n\033[1;32m[XTCP-TUN]\033[0m %s\n' "$*"; }
