@@ -1231,6 +1231,18 @@ show_logs() {
   else
     journalctl --no-pager -n 70 -u xtcp-tun-agent.service -u xtcp-tun-frpc-outside.service
   fi
+  # frps/frpc log to their own file (see log.to in the generated .toml
+  # configs) rather than to journald/stdout, so a startup error or crash
+  # inside either of them (bad config, port already taken, etc.) never
+  # shows up in the journalctl output above - only systemd's generic
+  # "Main process exited" line does. Tail those files too, or that kind
+  # of failure is effectively invisible from this menu option.
+  local f
+  for f in "$LOG_DIR"/*.log; do
+    [[ -f "$f" ]] || continue
+    printf '\n--- tail -n 40 %s ---\n' "$f"
+    tail -n 40 "$f"
+  done
 }
 
 uninstall_all() {
