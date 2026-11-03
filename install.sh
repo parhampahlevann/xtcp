@@ -1,7 +1,31 @@
 #!/usr/bin/env bash
 # XTCP-TUN Manager: IPv4 TUN-over-FRP-XTCP for Ubuntu/Debian
 #
-# Changes in this revision (frps startup robustness):
+# Changes in this revision (default control port moved):
+#   - FRPS_PORT moved from 7000 to 47000: on this user's Iran server,
+#     port 7000 (frp's own conventional default) was already held by
+#     another, unrelated service - almost certainly another already-
+#     installed FRP-based tunnel script, since frp defaults to 7000
+#     unless a script explicitly overrides it. The install-time
+#     preflight check added in the previous revision (still in place,
+#     see port_listening()) confirmed this directly rather than it
+#     showing up as a mysterious "connection refused" from frpc.
+#     47000 is outside the common-service / common-tunnel-tool range
+#     and was not reported as conflicting, but it is still checked at
+#     install time like any other port - if it or TCP_FALLBACK_PORT
+#     (17002) or TCPMUX_PORT (8443) ever turn out to collide with
+#     something else on a given box, change them here, at the top of
+#     the script, and reinstall; nothing else needs to change, since
+#     every other part of the script (configs, systemd units, ufw
+#     rules, menu text) reads these constants rather than hardcoding
+#     the port number anywhere.
+#   - Because the control port is baked into both sides' configs
+#     (frps.toml on Iran, frpc-outside.toml on the outside server),
+#     this updated script needs to be reinstalled on BOTH servers, not
+#     just the Iran one - a stale outside install would still try to
+#     dial the old port 7000 and fail the same way as before.
+#
+# Previous revision (frps startup robustness):
 #   - install_iran() now checks, before doing anything else, whether
 #     $FRPS_PORT, $TCP_FALLBACK_PORT or $TCPMUX_PORT are already bound
 #     by some other process on the box, and refuses to install if so.
@@ -112,7 +136,7 @@ AGENT_PATH="$BASE_DIR/tun-agent.py"
 TUN_DEV="xtcp0"
 IRAN_TUN_IP="10.0.0.1"
 OUTSIDE_TUN_IP="10.0.0.2"
-FRPS_PORT="7000"
+FRPS_PORT="47000"
 PIPE_SERVER_PORT="17000"
 PIPE_VISITOR_PORT="17001"
 MTU="1280"
