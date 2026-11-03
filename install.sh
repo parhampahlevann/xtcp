@@ -1,7 +1,35 @@
 #!/usr/bin/env bash
 # XTCP-TUN Manager: IPv4 TUN-over-FRP-XTCP for Ubuntu/Debian
 #
-# Changes in this revision (bug-fix / robustness pass):
+# Changes in this revision (frps startup robustness):
+#   - install_iran() now checks, before doing anything else, whether
+#     $FRPS_PORT, $TCP_FALLBACK_PORT or $TCPMUX_PORT are already bound
+#     by some other process on the box, and refuses to install if so.
+#     This is the single most common reason frps silently fails to
+#     start with no clear error: a second process - most often another
+#     already-installed FRP-based tunnel script on the same server,
+#     since its frps also defaults to port 7000 - wins the port first,
+#     and every later frps start attempt then fails with "address
+#     already in use", forever, with nothing about that in journalctl
+#     (frps logs to its own file, not journald/stdout - see show_logs()
+#     below). Previously this only surfaced as a mysterious "connection
+#     refused" from frpc, including on 127.0.0.1, with no indication of
+#     why.
+#   - xtcp-tun-frpc-iran.service no longer assumes frps is actually
+#     ready just because systemd marked xtcp-tun-frps.service "started":
+#     frps.service is Type=simple, so systemd considers it started as
+#     soon as the process forks, not once it has actually bound its
+#     listening port. A new ExecStartPre (wait-for-frps.sh) now blocks
+#     frpc-iran from starting until frps is genuinely accepting TCP
+#     connections on 127.0.0.1:$FRPS_PORT (up to 30s), closing a race
+#     that was most visible right after a reboot.
+#   - status_all() (menu option 3) and show_logs() (menu option 11) now
+#     both show which of this script's own ports are actually listening
+#     (ss -tlnp), not just established connections - the previous ss -tnp
+#     call (no -l) could never have shown that frps wasn't bound to its
+#     port at all, which was exactly the thing that needed to be visible.
+#
+# Previous revision (bug-fix / robustness pass):
 #   - Port-forward reservation now also covers the TCP fallback port
 #     ($TCP_FALLBACK_PORT) and the TCPMUX port ($TCPMUX_PORT), not just
 #     the FRP control port ($FRPS_PORT). Forwarding a user port onto
@@ -177,6 +205,19 @@ is_reserved_port() {
     "$FRPS_PORT"|"$TCP_FALLBACK_PORT"|"$TCPMUX_PORT") return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# True (exit 0) if something is already listening on local TCP port $1.
+# Used as an install-time preflight check: a second process - ours from
+# a previous broken attempt, or an unrelated service, most plausibly
+# another FRP-based tunnel script already set up on this same box, since
+# its frps defaults to this same port 7000 too - binding the port first
+# is the single most common reason frps then fails to start with nothing
+# useful in journalctl (frps logs to its own file; see show_logs()). Far
+# better to catch this before install than to chase a silent, recurring
+# "connection refused" afterwards.
+port_listening() {
+  ss -Htln "( sport = :$1 )" 2>/dev/null | grep -q .
 }
 
 # Best-effort detection of the port(s) sshd is actually listening on, used
@@ -562,6 +603,46 @@ PY
   rm -rf "$BASE_DIR/__pycache__"
 }
 
+# Writes $BASE_DIR/wait-for-frps.sh: a small helper invoked as
+# xtcp-tun-frpc-iran.service's ExecStartPre (see make_iran_units()).
+# "After=/Requires=xtcp-tun-frps.service" alone only guarantees frps's
+# process has been forked (Type=simple units are marked "started" by
+# systemd immediately on fork, not once they're actually listening), so
+# without this, frpc-iran could try - and fail - to log in before frps
+# has really bound its port, most visibly right after a reboot. The
+# heredoc below is intentionally quoted ('SCRIPT_EOF') so none of its
+# $-expansions happen at generation time; the port is passed in as an
+# argument from the unit file instead, where it IS substituted.
+write_wait_for_frps_script() {
+  cat > "$BASE_DIR/wait-for-frps.sh" <<'SCRIPT_EOF'
+#!/usr/bin/env bash
+# Usage: wait-for-frps.sh PORT [LOG_DIR]
+# Waits up to 30s for something to accept a TCP connection on
+# 127.0.0.1:PORT, then exits 0. Exits 1 (with a hint) if nothing ever
+# answers - which is also exactly what happens if some other process is
+# already holding that port and frps is crash-looping on "address
+# already in use" (the most common cause: another FRP-based tunnel
+# script already installed on this same box, since its frps defaults to
+# this same port too).
+set -u
+port="${1:?usage: wait-for-frps.sh PORT [LOG_DIR]}"
+log_dir="${2:-}"
+for ((i = 0; i < 30; i++)); do
+  if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    exec 3>&-
+    exit 0
+  fi
+  sleep 1
+done
+echo "frps is still not listening on 127.0.0.1:$port after 30s." >&2
+echo "Check: systemctl status xtcp-tun-frps.service" >&2
+[[ -n "$log_dir" ]] && echo "And:   tail -n 40 $log_dir/frps.log" >&2
+echo "A common cause: another process (e.g. another FRP-based tunnel script already on this box) is already holding that port, so frps keeps crash-looping on \"address already in use\" - check: ss -tlnp | grep \":$port\"" >&2
+exit 1
+SCRIPT_EOF
+  chmod 0755 "$BASE_DIR/wait-for-frps.sh"
+}
+
 setup_ufw_iran() {
   local peer_ip="${1:-}"
   command -v ufw >/dev/null 2>&1 || return 0
@@ -643,6 +724,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=$BASE_DIR/wait-for-frps.sh $FRPS_PORT $LOG_DIR
 ExecStart=$BASE_DIR/frpc -c $CONF_DIR/frpc-iran.toml
 Restart=always
 RestartSec=3
@@ -718,8 +800,15 @@ install_iran() {
   require_root
   [[ ! -f "$CONF_DIR/role" ]] || die "This manager is already installed on this server (role: $(cat "$CONF_DIR/role")). Check the status or uninstall first."
   install_packages
+  local p
+  for p in "$FRPS_PORT" "$TCP_FALLBACK_PORT" "$TCPMUX_PORT"; do
+    if port_listening "$p"; then
+      die "Port $p is already in use by another process on this server (check with: ss -tlnp | grep :$p). This is almost always another service already bound there - most commonly another FRP-based tunnel script already installed on this same box, since its frps also defaults to port $FRPS_PORT unless changed. Stop that service/port first, or change \$FRPS_PORT/\$TCP_FALLBACK_PORT/\$TCPMUX_PORT near the top of this script, then try again."
+    fi
+  done
   install_frp yes yes
   write_agent
+  write_wait_for_frps_script
   local detected iran_ip peer_ip frp_token xtcp_secret transport_protocol transport_bind_extra=""
   detected="$(curl -4fsS --connect-timeout 5 --max-time 8 https://api.ipify.org 2>/dev/null || true)"
   if ! valid_ipv4 "$detected"; then detected=""; fi
@@ -1018,6 +1107,10 @@ status_all() {
       printf '%-30s %s\n' "$s" "$(systemctl is-active "$s.service" 2>/dev/null || true)"
     fi
   done
+  printf '\n--- Listening ports (local) ---\n'
+  if ! ss -tlnp 2>/dev/null | grep -E ":($FRPS_PORT|$PIPE_SERVER_PORT|$PIPE_VISITOR_PORT|$TCP_FALLBACK_PORT|$TCPMUX_PORT)\b"; then
+    printf '  None of the expected ports are listening yet - the relevant service(s) have not actually bound their port; check option 11 (logs). If frps itself is missing here, something else may already be holding $FRPS_PORT.\n'
+  fi
   printf '\n--- Related connections ---\n'
   ss -tnp 2>/dev/null | grep -E ":($FRPS_PORT|$PIPE_SERVER_PORT|$PIPE_VISITOR_PORT|$TCP_FALLBACK_PORT|$TCPMUX_PORT)\b" || true
   if [[ "$(cat "$CONF_DIR/role")" == iran ]]; then
@@ -1226,6 +1319,10 @@ show_logs() {
   require_root
   [[ -f "$CONF_DIR/role" ]] || die "Not installed yet."
   local role="$(cat "$CONF_DIR/role")"
+  printf '\n--- Listening ports (local) ---\n'
+  if ! ss -tlnp 2>/dev/null | grep -E ":($FRPS_PORT|$PIPE_SERVER_PORT|$PIPE_VISITOR_PORT|$TCP_FALLBACK_PORT|$TCPMUX_PORT)\b"; then
+    printf '  None of the expected ports are listening yet.\n'
+  fi
   if [[ "$role" == iran ]]; then
     journalctl --no-pager -n 70 -u xtcp-tun-frps.service -u xtcp-tun-agent.service -u xtcp-tun-frpc-iran.service
   else
