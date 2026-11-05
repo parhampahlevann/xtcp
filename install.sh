@@ -1,170 +1,34 @@
 #!/usr/bin/env bash
-# XTCP-TUN Manager: IPv4 TUN-over-FRP-XTCP for Ubuntu/Debian
+# =============================================================================
+# XTCP-TUN Manager v2.0  (FRP 0.61.1 based IPv4 TUN tunnel: Iran <-> outside)
 #
-# Changes in this revision (fix: "Interface xtcp0 does not exist" / TUN
-# interface creation):
-#   - apply_rules() previously did a single, immediate
-#     `ip link show dev $TUN_DEV` and died right away if the interface
-#     wasn't there yet ("Interface xtcp0 does not exist; start the
-#     XTCP-TUN service first."). apply_rules() is reached not only from
-#     xtcp-tun-rules.service at boot (which is already ordered after
-#     xtcp-tun-agent.service, the unit that creates the interface) but
-#     also directly from the interactive menu - option 1 right after
-#     install, and options 7/8 (add/remove forward) at any later time -
-#     where no such ordering exists. A new wait_for_tun_interface()
-#     gives it up to 15s for the interface to appear before failing, and
-#     the die() message it now shows is far more actionable: it checks
-#     whether /dev/net/tun itself is missing (the most common real cause
-#     - TUN unavailable on some virtualized/container hosts) and points
-#     at `systemctl status xtcp-tun-agent.service` and menu option 11
-#     (logs), instead of just repeating "start the service first" with
-#     no next step.
-#   - install_packages() now calls a new ensure_tun_device(): it loads
-#     the tun kernel module (`modprobe tun`, best-effort) and, if
-#     /dev/net/tun is still missing, tries creating the device node
-#     directly (`mknod /dev/net/tun c 10 200`) - the standard workaround
-#     on some container-based VPS (e.g. OpenVZ) where the node can be
-#     absent even though the module itself is fine. If it's still
-#     missing after that, install now warns clearly at install time
-#     (rather than only surfacing as the opaque error above later) that
-#     TUN/TAP support may need to be enabled by the hosting provider for
-#     this specific server/container. Runs on both the Iran and the
-#     outside install, since tun-agent.py opens a TUN device on both
-#     sides.
-#   - status_all() (menu option 3) now also reports whether
-#     /dev/net/tun exists, right next to the tunnel-interface line, so a
-#     missing-TUN-device problem (the likely cause if the interface
-#     never comes up) is visible from status instead of only from logs.
-#
-# Previous revision (remaining default ports moved too):
-#   - The install-time preflight check (port_listening(), previous
-#     revision) caught a second collision on this box: TCP_FALLBACK_PORT
-#     17002 was also already held by another process (this check tests
-#     FRPS_PORT, TCP_FALLBACK_PORT and TCPMUX_PORT in order and stops at
-#     the first conflict, so TCPMUX_PORT 8443 was never actually tested
-#     yet - it may or may not have been free). Rather than risk a third
-#     round of this, both TCP_FALLBACK_PORT and TCPMUX_PORT are moved
-#     off their old defaults (17002, 8443 - the latter a fairly common
-#     choice for other tools' TLS/admin ports too) to 47001/47002,
-#     grouped right next to FRPS_PORT (47000) in a range nothing else on
-#     this particular box has been shown to use. As before, the
-#     preflight check still runs on every install, so if any of the
-#     three ever collides again on a given box it fails loudly and
-#     immediately, with the exact port named, instead of silently
-#     crash-looping.
-#   - Same reinstall note as before: these values are baked into both
-#     sides' configs at install time, so the updated script needs to be
-#     reinstalled on BOTH the Iran and the outside server, and the
-#     Iran datacenter firewall panel needs 47000-47002/tcp open instead
-#     of the old 7000/17002/8443.
-#
-# Previous revision (default control port moved):
-#   - install_iran() now checks, before doing anything else, whether
-#     $FRPS_PORT, $TCP_FALLBACK_PORT or $TCPMUX_PORT are already bound
-#     by some other process on the box, and refuses to install if so.
-#     This is the single most common reason frps silently fails to
-#     start with no clear error: a second process - most often another
-#     already-installed FRP-based tunnel script on the same server,
-#     since its frps also defaults to port 7000 - wins the port first,
-#     and every later frps start attempt then fails with "address
-#     already in use", forever, with nothing about that in journalctl
-#     (frps logs to its own file, not journald/stdout - see show_logs()
-#     below). Previously this only surfaced as a mysterious "connection
-#     refused" from frpc, including on 127.0.0.1, with no indication of
-#     why.
-#   - xtcp-tun-frpc-iran.service no longer assumes frps is actually
-#     ready just because systemd marked xtcp-tun-frps.service "started":
-#     frps.service is Type=simple, so systemd considers it started as
-#     soon as the process forks, not once it has actually bound its
-#     listening port. A new ExecStartPre (wait-for-frps.sh) now blocks
-#     frpc-iran from starting until frps is genuinely accepting TCP
-#     connections on 127.0.0.1:$FRPS_PORT (up to 30s), closing a race
-#     that was most visible right after a reboot.
-#   - status_all() (menu option 3) and show_logs() (menu option 11) now
-#     both show which of this script's own ports are actually listening
-#     (ss -tlnp), not just established connections - the previous ss -tnp
-#     call (no -l) could never have shown that frps wasn't bound to its
-#     port at all, which was exactly the thing that needed to be visible.
-#
-# Previous revision (bug-fix / robustness pass):
-#   - Port-forward reservation now also covers the TCP fallback port
-#     ($TCP_FALLBACK_PORT) and the TCPMUX port ($TCPMUX_PORT), not just
-#     the FRP control port ($FRPS_PORT). Forwarding a user port onto
-#     either of those silently hijacked traffic away from frps's own
-#     fallback listeners before it ever reached them - DNAT in the nat
-#     table's PREROUTING chain runs before the local-delivery decision,
-#     so it intercepts packets addressed to frps's own ports too, not
-#     just "foreign" traffic. add_forward() and prompt_initial_forwards()
-#     now refuse all three reserved ports, and apply_rules() itself skips
-#     (and warns about) any stale forwards.tsv entry that targets one, in
-#     case it predates this fix.
-#   - add_forward()/prompt_initial_forwards() now detect sshd's own
-#     listening port(s) (via `ss`, falling back to 22 if that's not
-#     possible) and require typed confirmation before forwarding onto
-#     one of them, since that would silently steal the admin's own SSH
-#     access to this box the next time the rules are applied.
-#   - setup_ufw_iran()'s "is the control port already allowed" check, and
-#     the rule it adds, were hardcoded to the literal "7000/tcp" instead
-#     of using $FRPS_PORT, so both would quietly stop matching reality if
-#     FRPS_PORT were ever changed from its default.
-#   - remove_forward() now backs up forwards.tsv and rolls it back if
-#     apply_rules() fails, the same way add_forward() already did,
-#     instead of leaving the saved config and the live iptables rules
-#     out of sync with no rollback and no clear explanation.
-#   - make_outside_units() now takes iran_ip as an explicit argument
-#     instead of silently relying on it being a `local` variable in
-#     whatever function happened to call it. That worked (bash's dynamic
-#     scoping makes a caller's `local` visible to whatever it calls), but
-#     it was fragile and non-obvious, so it's now explicit.
-#   - The TUN agent's systemd units now invoke the python3 binary
-#     resolved once at install time (via `command -v python3`) instead
-#     of a hardcoded /usr/bin/python3, and both gained
-#     NoNewPrivileges=true to match the frps/frpc units' hardening.
-#   - FRP pinned to v0.61.1 (was v0.71.1): the older release has been more
-#     stable for this use case.
-#   - Both installs (Iran and outside) ask which transport protocol
-#     frpc should use to reach frps: tcp (default - just press Enter),
-#     kcp, quic, websocket (ws) or wss. This is FRP's own
-#     transport.protocol setting for the frpc<->frps control connection,
-#     separate from the xtcp proxy's own internal quic/kcp hole-punching
-#     attempts below, which are unaffected and still tried automatically.
-#     Whatever is chosen MUST be the same on both servers; the Iran
-#     install prints its choice at the end, and it's also shown by menu
-#     option 10 (credentials) and option 3 (status).
-#   - The Iran install no longer requires a separate trip to menu option
-#     7 just to get traffic flowing: right after the services come up it
-#     waits for the tunnel interface, then asks directly for the port(s)
-#     to forward (comma-separated, e.g. "1080,443"), same as before.
-#     Pressing Enter there skips it and it can still be done later from
-#     option 7.
-#
-# Previous revision:
-#   - All user-facing text translated from Persian to English.
-#   - Menu actions now run in subshells, so a bad input or a failed step
-#     (which calls die()/exit) only aborts that one action instead of
-#     killing the whole interactive program (previously `set -e` + die()'s
-#     `exit 1` would terminate the entire script on any menu mistake).
-#   - run_ip() in the Python agent no longer hard-codes /usr/sbin/ip
-#     (missing on some Debian/Ubuntu images without the usr-merge); it now
-#     resolves `ip` via PATH, which systemd services already provide.
-#   - Port forwards can no longer be registered on the FRP control port
-#     (7000 by default), which would otherwise hijack frps's own traffic.
-#   - Add/remove forward now accept a comma-separated list of ports in one
-#     go, e.g. "1080,443", optionally with a different target port per
-#     entry using "listen:target", e.g. "1080:1081,443".
-#   - XTCP is no longer the only path: the outside agent now tries, in
-#     order, the local FRP visitor (which itself falls back internally
-#     from xtcp/quic -> xtcp/kcp -> stcp), then a direct 'tcp' type proxy,
-#     then frps's tcpmux (HTTP CONNECT) port - each one independent of
-#     the frpc<->frps control connection actually needing to work, for
-#     resilience if that connection itself is blocked.
+# What changed compared with v1 (all verified in a two-namespace lab):
+#  * Firewall: traffic arriving on the tunnel interface is now accepted on BOTH
+#    servers (iptables chain XTCP_TUN_IN + "ufw allow in on xtcp0" on the outside
+#    server). v1 never did this: with UFW / a default-deny INPUT policy the
+#    forwarded ports died (and ping died too if ICMP was filtered).
+#  * Agent rewritten: non-blocking I/O (v1 could dead-lock under two-way load),
+#    HMAC handshake (a path only counts as "up" after the other side answered),
+#    newest authenticated connection wins (v1 served ONE connection and a stale or
+#    scanner connection could block the tunnel), fast dead-peer detection,
+#    reconnect backoff resets, paths are retried from the best one.
+#  * Port forwarding no longer depends on detecting the WAN interface.
+#  * The "wss" transport was removed: frps cannot terminate wss by itself
+#    (frpc fails with "unexpected EOF"); use websocket instead.
+#  * modprobe failure no longer kills the install; errors no longer close the menu.
+#  * New: option 13 (test tunnel), 14 (repair / upgrade in place), subnet-conflict
+#    check, "relay" mode (no UDP needed), frps hardened (allowPorts/maxPortsPerClient).
+# =============================================================================
 set -Eeuo pipefail
 
+SCRIPT_VERSION="2.0"
 FRP_VERSION="0.61.1"
-BASE_DIR="/opt/xtcp-tun"
-CONF_DIR="/etc/xtcp-tun"
-LOG_DIR="/var/log/xtcp-tun"
-MANAGER_PATH="/usr/local/sbin/xtcp-tun-manager"
+BASE_DIR="${XTCP_BASE_DIR:-/opt/xtcp-tun}"
+CONF_DIR="${XTCP_CONF_DIR:-/etc/xtcp-tun}"
+LOG_DIR="${XTCP_LOG_DIR:-/var/log/xtcp-tun}"
+UNIT_DIR="${XTCP_UNIT_DIR:-/etc/systemd/system}"
+STATE_FILE="${XTCP_STATE_FILE:-/run/xtcp-tun/agent.json}"
+MANAGER_PATH="${XTCP_MANAGER_PATH:-/usr/local/sbin/xtcp-tun-manager}"
 AGENT_PATH="$BASE_DIR/tun-agent.py"
 TUN_DEV="xtcp0"
 IRAN_TUN_IP="10.0.0.1"
@@ -173,61 +37,24 @@ FRPS_PORT="47000"
 PIPE_SERVER_PORT="17000"
 PIPE_VISITOR_PORT="17001"
 MTU="1280"
-# Fixed TCP MSS clamp for forwarded connections that cross the tunnel
-# (set on the Iran side in apply_rules()). 1280 (MTU) - 40 (IPv4 + TCP
-# header overhead) = 1240. A fixed --set-mss is used instead of
-# --clamp-mss-to-pmtu: the latter relies on ICMP "fragmentation needed"
-# messages for path-MTU discovery, and those are exactly the kind of
-# packets a restrictive network is prone to dropping, which can make
-# clamp-to-pmtu silently fail to clamp at all. A fixed value sidesteps
-# that by rewriting the MSS option directly, with no ICMP involved.
+# Fixed TCP MSS for forwarded connections that cross the tunnel: 1280 (MTU) - 40.
 TUNNEL_MSS="1240"
 
-# Fixed shared credentials: used on both the Iran side (generated into
-# frps/frpc-iran config) and the outside side (no longer prompted for),
-# so both ends always match without the outside install asking for them.
-# NOTE: since this value lives in the script itself, anyone who gets a
-# copy of the script gets the same token/secret as every other install
-# made from it. Fine for a single private Iran<->outside pair; if this
-# script is ever copied to another box pair, change these two lines first.
-DEFAULT_FRP_TOKEN="740ef87eef4da026d23581899eac95a2015c6eb3d227040d18c28d5ddc86f92d"
-DEFAULT_XTCP_SECRET="81fdeae86511c25c380b37e6e20ceffa1cb13f7d0edff61bf08f86eb78db187b"
+# Fixed shared credentials (same on both servers). Anyone holding a copy of this
+# script knows them - fine for a private pair, change them (or export
+# XTCP_FRP_TOKEN / XTCP_SECRET on BOTH servers before installing) if the script is
+# shared. The agent handshake uses the XTCP secret.
+DEFAULT_FRP_TOKEN="${XTCP_FRP_TOKEN:-740ef87eef4da026d23581899eac95a2015c6eb3d227040d18c28d5ddc86f92d}"
+DEFAULT_XTCP_SECRET="${XTCP_SECRET:-81fdeae86511c25c380b37e6e20ceffa1cb13f7d0edff61bf08f86eb78db187b}"
 
-# STUN server both frpc instances use to discover their own public
-# address for XTCP (P2P) NAT hole punching. The frp default,
-# stun.easyvoip.com:3478, is often unreachable from inside Iran, which
-# by itself is enough to make XTCP fail outright (protocol choice never
-# even comes into play). If XTCP still won't connect, test this host's
-# reachability (UDP) from the Iran server first and swap in a reachable
-# STUN server here.
-NAT_HOLE_STUN_SERVER="stun.easyvoip.com:3478"
-# How long (ms) XTCP waits for direct P2P hole punching with one
-# transport before moving to the next one in the fallback chain
-# (quic -> kcp -> guaranteed stcp relay through frps).
+# STUN server both frpc instances use for XTCP (UDP hole punching). If it is not
+# reachable from Iran, XTCP simply falls back to the relay (stcp) path.
+NAT_HOLE_STUN_SERVER="${XTCP_STUN_SERVER:-stun.easyvoip.com:3478}"
 XTCP_FALLBACK_TIMEOUT_MS="1500"
 
-# Two more, independent fallback paths used only if the whole FRP-visitor
-# chain above (quic/kcp/stcp) can't even be reached - e.g. the frpc<->frps
-# control connection on $FRPS_PORT itself is blocked. Both are public ports
-# exposed straight off frps on the Iran server, so the outside agent can
-# reach them WITHOUT going through its own frpc/control-channel at all.
-# TCP_FALLBACK_PORT: a plain 'tcp' type frp proxy - a raw forwarded port,
-#   no NAT traversal needed, works as long as this port itself is reachable.
-# TCPMUX_PORT / TCPMUX_DOMAIN: frps's tcpmuxHTTPConnectPort - the outside
-#   agent connects and sends a plain HTTP CONNECT request, so on the wire
-#   this looks like ordinary HTTPS forward-proxy traffic rather than a
-#   custom tunnel protocol. Change TCPMUX_PORT to 443 for the strongest
-#   camouflage IF nothing else on the Iran server already uses that port.
-# NOTE: unlike xtcp/stcp, tcp/tcpmux proxies have no secretKey gating -
-# anyone who finds these two ports can connect straight into the tunnel.
-# The installer restricts both to the outside server's IP via ufw when
-# that IP is given; without it they're left open to the internet - still
-# worth locking down by hand (ufw/iptables/cloud firewall) to that IP.
-# Also note: unlike the xtcp/stcp path, these two fallbacks carry the
-# tunneled IP packets without any frp-level payload encryption of their
-# own (the public-facing leg here is a raw socket the Python agent dials
-# directly, bypassing frpc's encrypted work-connection machinery) - treat
-# them as a connectivity-of-last-resort path, not a confidential one.
+# Independent fallback paths straight off frps (work even if the frpc<->frps
+# control channel is blocked). The agent handshake keeps strangers out, but the
+# payload on these two paths is NOT encrypted - last-resort paths only.
 TCP_FALLBACK_PORT="47001"
 TCPMUX_PORT="47002"
 TCPMUX_DOMAIN="xtcp-l3"
@@ -250,13 +77,26 @@ valid_port() {
   [[ "${1:-}" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
 }
 
-# True (exit 0) if $1 is one of the ports this script's own control or
-# fallback channels need for itself: the FRP control port and the two
-# outside-agent fallback ports. A user-added forward is never allowed to
-# target one of these - DNAT in the nat table's PREROUTING chain runs
-# before the local-delivery decision, so it would divert traffic away
-# from frps's own listener on that port before frps (or frpc) ever saw
-# it, silently breaking that channel with no obvious error.
+get_role() { cat "$CONF_DIR/role" 2>/dev/null || true; }
+peer_tun_ip() {
+  case "$(get_role)" in
+    iran) printf '%s' "$OUTSIDE_TUN_IP" ;;
+    outside) printf '%s' "$IRAN_TUN_IP" ;;
+  esac
+}
+ufw_active() {
+  command -v ufw >/dev/null 2>&1 || return 1
+  local out
+  out="$(ufw status 2>/dev/null || true)"
+  [[ "$out" == *"Status: active"* ]]
+}
+ufw_has_allow_for() {
+  local out
+  out="$(ufw status 2>/dev/null || true)"
+  awk -v ip="$1" 'index($0, ip) && /ALLOW/ {f=1} END{exit !f}' <<<"$out"
+}
+
+# Ports the script's own channels need; a forward must never target them.
 is_reserved_port() {
   case "${1:-}" in
     "$FRPS_PORT"|"$TCP_FALLBACK_PORT"|"$TCPMUX_PORT") return 0 ;;
@@ -264,66 +104,32 @@ is_reserved_port() {
   esac
 }
 
-# True (exit 0) if something is already listening on local TCP port $1.
-# Used as an install-time preflight check: a second process - ours from
-# a previous broken attempt, or an unrelated service, most plausibly
-# another FRP-based tunnel script already set up on this same box, since
-# its frps defaults to this same port 7000 too - binding the port first
-# is the single most common reason frps then fails to start with nothing
-# useful in journalctl (frps logs to its own file; see show_logs()). Far
-# better to catch this before install than to chase a silent, recurring
-# "connection refused" afterwards.
 port_listening() {
-  ss -Htln "( sport = :$1 )" 2>/dev/null | grep -q .
+  [[ -n "$(ss -Htln "( sport = :$1 )" 2>/dev/null || true)" ]]
 }
 
-# True (exit 0) once $TUN_DEV exists, waiting up to ~15s for it to appear
-# first instead of failing on the spot. apply_rules() - which uses this -
-# is reached both from xtcp-tun-rules.service (already ordered after
-# xtcp-tun-agent.service, the Type=notify unit that actually creates the
-# interface in open_tun() before it reports ready) and directly from the
-# interactive menu (install, or add/remove forward later), where no such
-# systemd ordering exists. A short bounded wait absorbs ordinary startup
-# timing without masking a real, lasting problem - TUN unavailable, or
-# the agent failing to start at all - which still surfaces as a clear
-# failure once the wait is exhausted (see the die() message in
-# apply_rules()).
 wait_for_tun_interface() {
-  local tries=0
+  local max="${1:-15}" tries=0
   until ip link show dev "$TUN_DEV" >/dev/null 2>&1; do
-    (( tries < 15 )) || return 1
+    (( tries < max )) || return 1
     sleep 1
     tries=$((tries + 1))
   done
   return 0
 }
 
-# Best-effort detection of the port(s) sshd is actually listening on, used
-# to warn before a forward would silently steal the admin's own SSH
-# access to this box. Falls back to the conventional port 22 if sshd
-# can't be found this way (ss missing, sshd not running as "sshd", etc.).
 detect_ssh_ports() {
   local ports
-  ports="$(ss -Htlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -u)"
-  if [[ -z "$ports" ]]; then
-    printf '22\n'
-  else
-    printf '%s\n' "$ports"
-  fi
+  ports="$(ss -Htlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -u || true)"
+  if [[ -z "$ports" ]]; then printf '22\n'; else printf '%s\n' "$ports"; fi
 }
 
-# If $1 is (as far as we can tell) sshd's own listening port, warns and
-# requires the user to type YES to proceed anyway. Returns 1 (caller
-# should skip this port) if they don't confirm; returns 0 immediately if
-# the port doesn't look like an SSH port. Never calls die() - callers
-# decide whether a "no" here is fatal for the whole action or just skips
-# this one port.
 confirm_not_ssh_port() {
   local listen="$1" ssh_ports p confirm
   ssh_ports="$(detect_ssh_ports)"
   for p in $ssh_ports; do
     if [[ "$listen" == "$p" ]]; then
-      warn "Port $listen looks like sshd's own listening port on this server. Forwarding it through the tunnel will silently steal new SSH connections away from this box the next time the rules are applied - you could lock yourself out."
+      warn "Port $listen looks like sshd's own port on this server. Forwarding it through the tunnel will take new SSH connections away from this box - you could lock yourself out."
       read -rp "Type YES to forward it anyway, or press Enter to skip this port: " confirm
       [[ "$confirm" == "YES" ]] || return 1
       break
@@ -332,12 +138,6 @@ confirm_not_ssh_port() {
   return 0
 }
 
-# Prompts for which protocol frpc should use to reach frps (FRP's own
-# transport.protocol setting for the frpc<->frps control connection -
-# separate from the xtcp proxy's own quic/kcp hole-punching attempts,
-# which are unaffected and still tried automatically either way).
-# Sets $CHOSEN_TRANSPORT_PROTOCOL. Whatever is picked here must be the
-# same on both the Iran and outside installs.
 choose_transport_protocol() {
   local choice
   printf '\nConnection protocol between the two servers (frpc -> frps):\n'
@@ -345,65 +145,89 @@ choose_transport_protocol() {
   printf '  2) kcp        - UDP-based, can lower latency, less reliable through strict firewalls\n'
   printf '  3) quic       - UDP-based, modern, needs solid UDP reachability\n'
   printf '  4) websocket  - ws: TCP + HTTP upgrade, blends in with ordinary web traffic\n'
-  printf '  5) wss        - ws + TLS, blends in with ordinary HTTPS traffic\n'
   read -rp "Choice [1]: " choice
   case "${choice:-1}" in
     1) CHOSEN_TRANSPORT_PROTOCOL="tcp" ;;
     2) CHOSEN_TRANSPORT_PROTOCOL="kcp" ;;
     3) CHOSEN_TRANSPORT_PROTOCOL="quic" ;;
     4) CHOSEN_TRANSPORT_PROTOCOL="websocket" ;;
-    5) CHOSEN_TRANSPORT_PROTOCOL="wss" ;;
     *) warn "Invalid choice; using tcp."; CHOSEN_TRANSPORT_PROTOCOL="tcp" ;;
   esac
-  log "Transport protocol: $CHOSEN_TRANSPORT_PROTOCOL (this must be the same on the other server)."
+  log "Transport protocol: $CHOSEN_TRANSPORT_PROTOCOL (must be the same on the other server)."
 }
 
+choose_mode() {
+  local choice
+  printf '\nPath mode on the outside server:\n'
+  printf '  1) auto  - try direct UDP hole punching first (xtcp: quic -> kcp), then relay through frps (stcp)\n'
+  printf '  2) relay - always relay through frps over TCP; no UDP/STUN involved, most predictable\n'
+  read -rp "Choice [1]: " choice
+  case "${choice:-1}" in
+    2) CHOSEN_MODE="relay" ;;
+    *) CHOSEN_MODE="auto" ;;
+  esac
+  log "Path mode: $CHOSEN_MODE"
+}
 
-# Best-effort: makes sure the TUN kernel module is loaded and /dev/net/tun
-# exists before any service is started. The single most common real cause
-# behind "Interface $TUN_DEV does not exist" (see wait_for_tun_interface(),
-# used by apply_rules()) is that TUN itself isn't available on this host -
-# common on some budget VPS/container virtualization (e.g. OpenVZ), where
-# the device node can be missing even if the kernel module is fine, and
-# where full TUN access sometimes has to be enabled by the hosting
-# provider for this specific container - something this script cannot do
-# on its own. Runs for both roles: tun-agent.py opens a TUN device on the
-# Iran side (server mode) and the outside side (client mode) alike.
+# Makes sure the TUN device exists. A failing modprobe (containers, built-in
+# driver) must NOT abort the install - with `set -e` the old `a && b` form did.
 ensure_tun_device() {
-  command -v modprobe >/dev/null 2>&1 && modprobe tun >/dev/null 2>&1
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe tun >/dev/null 2>&1 || true
+  fi
   if [[ ! -e /dev/net/tun ]]; then
     mkdir -p /dev/net 2>/dev/null || true
     mknod -m 600 /dev/net/tun c 10 200 2>/dev/null || true
   fi
+  if [[ -d /etc/modules-load.d && ! -f /etc/modules-load.d/xtcp-tun.conf ]]; then
+    printf 'tun\n' > /etc/modules-load.d/xtcp-tun.conf 2>/dev/null || true
+  fi
   if [[ ! -e /dev/net/tun ]]; then
-    warn "/dev/net/tun is still missing after trying to load the tun module and create the device node. If this server is a container (OpenVZ/LXC/etc.), TUN/TAP support usually has to be enabled by the hosting provider for this specific container - that is outside what this script can do from inside it. Install will continue, but the tunnel interface will not come up until this is resolved; check menu option 11 (logs) for the agent's exact error, and option 3 (status) for whether /dev/net/tun exists."
+    warn "/dev/net/tun is missing. On a container (OpenVZ/LXC) the hosting provider must enable TUN/TAP for this server. The install continues, but the tunnel interface will not come up until that is fixed (see option 11 logs and option 3 status)."
+  fi
+}
+
+install_self_copy() {
+  local self_path target
+  self_path="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
+  [[ -f "$self_path" ]] || die "Could not find the script file; save xtcp-tun-manager.sh on the server first, then run it with bash."
+  target="$(readlink -f -- "$MANAGER_PATH" 2>/dev/null || printf '%s' "$MANAGER_PATH")"
+  if [[ "$self_path" != "$target" ]]; then
+    mkdir -p "$(dirname "$MANAGER_PATH")"
+    install -m 0755 "$self_path" "$MANAGER_PATH"
   fi
 }
 
 install_packages() {
   command -v apt-get >/dev/null 2>&1 || die "This version currently targets Ubuntu/Debian only."
-  log "Checking and installing required dependencies (no apt update/upgrade)..."
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates curl iproute2 iptables python3 >/dev/null
+  local spec cmd pkg missing=()
+  for spec in curl:curl ip:iproute2 ss:iproute2 iptables:iptables python3:python3 ping:iputils-ping tar:tar; do
+    cmd="${spec%%:*}"; pkg="${spec##*:}"
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$pkg")
+  done
+  [[ -f /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
+  if (( ${#missing[@]} > 0 )); then
+    log "Installing missing packages: ${missing[*]}"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"; then
+      warn "apt-get install failed; refreshing the package index once and retrying..."
+      apt-get update || warn "apt-get update failed (mirror unreachable?)"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}" \
+        || die "Could not install: ${missing[*]} - install them manually, then run this script again."
+    fi
+  else
+    log "All required packages are already installed."
+  fi
   mkdir -p "$BASE_DIR" "$CONF_DIR" "$LOG_DIR"
   chmod 700 "$CONF_DIR"
   chmod 755 "$BASE_DIR" "$LOG_DIR"
   ensure_tun_device
-  local self_path
-  self_path="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
-  [[ -f "$self_path" ]] || die "Could not find the script file; save xtcp-tun-manager.sh on the server first, then run it with bash."
-  install -m 0755 "$self_path" "$MANAGER_PATH"
-  # Resolved once here (not hardcoded as /usr/bin/python3) so the agent's
-  # systemd units keep working even on a system where python3 isn't at
-  # that exact path. This is a plain (non-local) assignment so it's still
-  # visible later in make_iran_units()/make_outside_units(), the same way
-  # choose_transport_protocol() hands back CHOSEN_TRANSPORT_PROTOCOL.
+  install_self_copy
   PYTHON_BIN="$(command -v python3)"
   [[ -n "$PYTHON_BIN" ]] || die "python3 was installed but could not be found on PATH."
 }
 
 install_frp() {
-  local need_frpc="$1" need_frps="$2" machine_arch arch tmp archive extracted url
+  local need_frpc="$1" need_frps="$2" machine_arch arch tmp archive extracted url cand src_dir
   machine_arch="$(uname -m)"
   case "$machine_arch" in
     x86_64|amd64) arch="amd64" ;;
@@ -413,15 +237,24 @@ install_frp() {
   tmp="$(mktemp -d /tmp/xtcp-frp.XXXXXX)"
   archive="$tmp/frp.tar.gz"
   url="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_${arch}.tar.gz"
-  log "Downloading FRP ${FRP_VERSION} for Linux/${arch} from the official repository..."
-  if ! curl -fL --retry 3 --connect-timeout 15 --max-time 240 "$url" -o "$archive"; then
-    rm -rf "$tmp"
-    die "FRP download failed. Check HTTPS access to GitHub and that this architecture is available."
+  src_dir="$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")")"
+  # Offline friendly: a tarball already on this server is used instead of GitHub.
+  local have_local=no
+  for cand in "${XTCP_FRP_TARBALL:-}" "$src_dir/frp_${FRP_VERSION}_linux_${arch}.tar.gz" \
+              "/root/frp_${FRP_VERSION}_linux_${arch}.tar.gz" "/tmp/frp_${FRP_VERSION}_linux_${arch}.tar.gz"; do
+    if [[ -n "$cand" && -f "$cand" ]]; then cp "$cand" "$archive"; have_local=yes; log "Using the local FRP archive: $cand"; break; fi
+  done
+  if [[ "$have_local" == no ]]; then
+    log "Downloading FRP ${FRP_VERSION} for Linux/${arch} from the official repository..."
+    if ! curl -fL --retry 3 --connect-timeout 15 --max-time 240 "$url" -o "$archive"; then
+      rm -rf "$tmp"
+      die "FRP download failed. Check HTTPS access to GitHub, or copy frp_${FRP_VERSION}_linux_${arch}.tar.gz next to this script (or set XTCP_FRP_TARBALL=/path) and run again."
+    fi
   fi
-  tar -tzf "$archive" >/dev/null || { rm -rf "$tmp"; die "The downloaded FRP archive is not a valid tarball."; }
+  tar -tzf "$archive" >/dev/null 2>&1 || { rm -rf "$tmp"; die "The FRP archive is not a valid tarball."; }
   tar -xzf "$archive" -C "$tmp"
   extracted="$tmp/frp_${FRP_VERSION}_linux_${arch}"
-  [[ -d "$extracted" ]] || { rm -rf "$tmp"; die "Could not find the FRP version folder inside the downloaded archive."; }
+  [[ -d "$extracted" ]] || { rm -rf "$tmp"; die "Could not find the FRP version folder inside the archive."; }
   if [[ "$need_frpc" == yes ]]; then
     [[ -x "$extracted/frpc" ]] || { rm -rf "$tmp"; die "The frpc binary is missing from the archive."; }
     install -m 0755 "$extracted/frpc" "$BASE_DIR/frpc"
@@ -434,297 +267,21 @@ install_frp() {
 }
 
 write_agent() {
+  mkdir -p "$BASE_DIR"
   cat > "$AGENT_PATH" <<'PY'
-#!/usr/bin/env python3
-"""Small IPv4 TUN packet bridge carried by an FRP XTCP byte stream."""
-import argparse
-import errno
-import fcntl
-import os
-import select
-import socket
-import struct
-import subprocess
-import sys
-import time
-
-TUNSETIFF = 0x400454CA
-IFF_TUN = 0x0001
-IFF_NO_PI = 0x1000
-
-
-def log(msg):
-    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
-
-
-def sd_notify(message):
-    address = os.environ.get("NOTIFY_SOCKET")
-    if not address:
-        return
-    if address.startswith("@"):
-        address = "\0" + address[1:]
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify_sock:
-            notify_sock.connect(address)
-            notify_sock.sendall(message.encode("utf-8"))
-    except OSError as exc:
-        log(f"systemd notify warning: {exc}")
-
-
-def run_ip(*args):
-    # Resolved via PATH rather than hard-coded, since some Debian/Ubuntu
-    # images only have /sbin/ip without a /usr/sbin/ip symlink. systemd's
-    # default exec PATH already includes /usr/sbin, /sbin, /usr/bin, /bin.
-    subprocess.run(["ip", *args], check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-
-
-def open_tun(dev, cidr, mtu):
-    if not os.path.exists("/dev/net/tun"):
-        raise RuntimeError("/dev/net/tun is missing; ensure the TUN kernel module/device is available")
-    fd = os.open("/dev/net/tun", os.O_RDWR)
-    ifr = struct.pack("16sH22x", dev.encode("ascii")[:15], IFF_TUN | IFF_NO_PI)
-    try:
-        fcntl.ioctl(fd, TUNSETIFF, ifr)
-        run_ip("link", "set", "dev", dev, "mtu", str(mtu))
-        run_ip("addr", "replace", cidr, "dev", dev)
-        run_ip("link", "set", "dev", dev, "up")
-    except Exception:
-        os.close(fd)
-        raise
-    log(f"TUN ready: {dev} {cidr}, MTU {mtu}")
-    return fd
-
-
-def parse_addr(value):
-    host, sep, port = value.rpartition(":")
-    if not sep or not host or not port:
-        raise ValueError("address must be HOST:PORT")
-    p = int(port)
-    if p < 1 or p > 65535:
-        raise ValueError("port must be between 1 and 65535")
-    return host, p
-
-
-def bridge(conn, tun_fd, mtu, label, preload=b""):
-    conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    conn.settimeout(None)
-    buf = bytearray(preload)
-    last_rx = time.monotonic()
-    next_heartbeat = last_rx + 15.0
-    log(f"Tunnel stream connected ({label})")
-    while True:
-        readable, _, _ = select.select([tun_fd, conn], [], [], 1.0)
-        if tun_fd in readable:
-            packet = os.read(tun_fd, 65535)
-            if packet:
-                if len(packet) > 65535:
-                    raise RuntimeError("oversized TUN packet")
-                conn.sendall(struct.pack("!H", len(packet)) + packet)
-        if conn in readable:
-            chunk = conn.recv(65535)
-            if not chunk:
-                raise ConnectionError("XTCP stream closed")
-            last_rx = time.monotonic()
-            buf.extend(chunk)
-            while len(buf) >= 2:
-                size = struct.unpack("!H", buf[:2])[0]
-                if size == 0:
-                    # Two zero bytes are an application-level heartbeat, not an IP packet.
-                    del buf[:2]
-                    continue
-                if len(buf) < size + 2:
-                    break
-                packet = bytes(buf[2:size + 2])
-                del buf[:size + 2]
-                if len(packet) > mtu:
-                    raise RuntimeError(f"packet size {len(packet)} exceeds configured MTU {mtu}")
-                written = os.write(tun_fd, packet)
-                if written != len(packet):
-                    raise OSError(errno.EIO, "partial write to TUN device")
-        now = time.monotonic()
-        if now - last_rx > 90.0:
-            raise TimeoutError("no data/heartbeat from peer for 90 seconds")
-        if now >= next_heartbeat:
-            conn.sendall(b"\x00\x00")
-            next_heartbeat = now + 15.0
-
-
-def run_server(args, tun_fd):
-    host, port = parse_addr(args.listen)
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((host, port))
-    srv.listen(4)
-    log(f"Waiting for FRP XTCP local connection on {host}:{port}")
-    sd_notify("READY=1")
-    while True:
-        conn, peer = srv.accept()
-        try:
-            bridge(conn, tun_fd, args.mtu, f"server peer {peer[0]}:{peer[1]}")
-        except (ConnectionError, OSError, RuntimeError) as exc:
-            log(f"Stream ended: {exc}")
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        time.sleep(0.5)
-
-
-def tcpmux_connect(host, port, connect_host, timeout=10):
-    """Open conn via frps's tcpmuxHTTPConnectPort: a plain TCP connect followed
-    by an HTTP CONNECT request, so the traffic looks like an ordinary HTTPS
-    forward-proxy request rather than a custom tunnel protocol. Returns
-    (socket, preload) where preload is any tunnel bytes read past the HTTP
-    response headers in the same recv() call."""
-    sock = socket.create_connection((host, port), timeout=timeout)
-    sock.settimeout(timeout)
-    try:
-        sock.sendall(f"CONNECT {connect_host} HTTP/1.1\r\nHost: {connect_host}\r\n\r\n".encode("ascii"))
-        buf = b""
-        while b"\r\n\r\n" not in buf:
-            chunk = sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("tcpmux: connection closed during CONNECT handshake")
-            buf += chunk
-            if len(buf) > 8192:
-                raise ConnectionError("tcpmux: CONNECT response too large")
-        head, preload = buf.split(b"\r\n\r\n", 1)
-        status_line = head.split(b"\r\n", 1)[0].decode("latin1", "replace")
-        parts = status_line.split(" ")
-        if len(parts) < 2 or parts[1] != "200":
-            raise ConnectionError(f"tcpmux: CONNECT rejected: {status_line!r}")
-    except Exception:
-        sock.close()
-        raise
-    sock.settimeout(None)
-    return sock, preload
-
-
-def run_client(args, tun_fd):
-    local_addr = parse_addr(args.connect)
-    direct_tcp_addr = parse_addr(args.direct_tcp) if args.direct_tcp else None
-    tcpmux_addr = parse_addr(args.tcpmux) if args.tcpmux else None
-
-    def try_local():
-        host, port = local_addr
-        log(f"Trying local FRP visitor at {host}:{port} (xtcp/quic -> xtcp/kcp -> stcp)")
-        return socket.create_connection((host, port), timeout=10), b""
-
-    def try_direct_tcp():
-        host, port = direct_tcp_addr
-        log(f"Trying direct TCP fallback at {host}:{port}")
-        return socket.create_connection((host, port), timeout=10), b""
-
-    def try_tcpmux():
-        host, port = tcpmux_addr
-        log(f"Trying TCPMUX (HTTP CONNECT) fallback at {host}:{port}")
-        return tcpmux_connect(host, port, args.tcpmux_host, timeout=10)
-
-    # Tried in this order every cycle: best-performing path first, each
-    # weaker/slower-but-more-likely-to-get-through option after it. Any one
-    # of these failing just advances to the next; none configured (empty
-    # --direct-tcp/--tcpmux) means that step is skipped entirely.
-    attempts = [("local FRP visitor (xtcp/stcp)", try_local)]
-    if direct_tcp_addr:
-        attempts.append(("direct TCP fallback", try_direct_tcp))
-    if tcpmux_addr:
-        attempts.append(("TCPMUX fallback", try_tcpmux))
-
-    delay = 2
-    idx = 0
-    sd_notify("READY=1")
-    while True:
-        label, attempt = attempts[idx % len(attempts)]
-        conn = None
-        try:
-            conn, preload = attempt()
-            conn.settimeout(None)
-            bridge(conn, tun_fd, args.mtu, label, preload=preload)
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            log(f"{label} failed/closed: {exc}; retry in {delay}s")
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
-        idx += 1
-        time.sleep(delay)
-        delay = min(delay * 2, 15)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="IPv4 TUN packet bridge for FRP XTCP")
-    subs = parser.add_subparsers(dest="mode", required=True)
-    server = subs.add_parser("server")
-    server.add_argument("--dev", default="xtcp0")
-    server.add_argument("--cidr", default="10.0.0.1/30")
-    server.add_argument("--listen", default="127.0.0.1:17000")
-    server.add_argument("--mtu", type=int, default=1280)
-    client = subs.add_parser("client")
-    client.add_argument("--dev", default="xtcp0")
-    client.add_argument("--cidr", default="10.0.0.2/30")
-    client.add_argument("--connect", default="127.0.0.1:17001")
-    client.add_argument("--direct-tcp", default=None,
-                         help="HOST:PORT of a plain 'tcp' type frp proxy, tried if the local FRP visitor fails")
-    client.add_argument("--tcpmux", default=None,
-                         help="HOST:PORT of frps's tcpmuxHTTPConnectPort, tried last via an HTTP CONNECT request")
-    client.add_argument("--tcpmux-host", default="xtcp-l3",
-                         help="Host value sent in the tcpmux CONNECT request; must match the proxy's customDomains entry")
-    client.add_argument("--mtu", type=int, default=1280)
-    args = parser.parse_args()
-    if not 576 <= args.mtu <= 9000:
-        parser.error("MTU must be between 576 and 9000")
-    tun_fd = open_tun(args.dev, args.cidr, args.mtu)
-    try:
-        if args.mode == "server":
-            run_server(args, tun_fd)
-        else:
-            run_client(args, tun_fd)
-    finally:
-        os.close(tun_fd)
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        pass
-    except Exception as exc:
-        log(f"FATAL: {exc}")
-        raise
+@@AGENT_PY@@
 PY
   chmod 0755 "$AGENT_PATH"
   python3 -m py_compile "$AGENT_PATH" || die "Syntax check of the TUN agent script failed."
   rm -rf "$BASE_DIR/__pycache__"
 }
 
-# Writes $BASE_DIR/wait-for-frps.sh: a small helper invoked as
-# xtcp-tun-frpc-iran.service's ExecStartPre (see make_iran_units()).
-# "After=/Requires=xtcp-tun-frps.service" alone only guarantees frps's
-# process has been forked (Type=simple units are marked "started" by
-# systemd immediately on fork, not once it's actually listening), so
-# without this, frpc-iran could try - and fail - to log in before frps
-# has really bound its port, most visibly right after a reboot. The
-# heredoc below is intentionally quoted ('SCRIPT_EOF') so none of its
-# $-expansions happen at generation time; the port is passed in as an
-# argument from the unit file instead, where it IS substituted.
+# frpc-iran must not log in before frps really listens (systemd marks a
+# Type=simple unit started the moment it is forked).
 write_wait_for_frps_script() {
   cat > "$BASE_DIR/wait-for-frps.sh" <<'SCRIPT_EOF'
 #!/usr/bin/env bash
 # Usage: wait-for-frps.sh PORT [LOG_DIR]
-# Waits up to 30s for something to accept a TCP connection on
-# 127.0.0.1:PORT, then exits 0. Exits 1 (with a hint) if nothing ever
-# answers - which is also exactly what happens if some other process is
-# already holding that port and frps is crash-looping on "address
-# already in use" (the most common cause: another FRP-based tunnel
-# script already installed on this same box, since its frps defaults to
-# this same port too).
 set -u
 port="${1:?usage: wait-for-frps.sh PORT [LOG_DIR]}"
 log_dir="${2:-}"
@@ -738,47 +295,80 @@ done
 echo "frps is still not listening on 127.0.0.1:$port after 30s." >&2
 echo "Check: systemctl status xtcp-tun-frps.service" >&2
 [[ -n "$log_dir" ]] && echo "And:   tail -n 40 $log_dir/frps.log" >&2
-echo "A common cause: another process (e.g. another FRP-based tunnel script already on this box) is already holding that port, so frps keeps crash-looping on \"address already in use\" - check: ss -tlnp | grep \":$port\"" >&2
+echo "A common cause: another process (e.g. another FRP based tunnel script) already holds that port - check: ss -tlnp | grep \":$port\"" >&2
 exit 1
 SCRIPT_EOF
   chmod 0755 "$BASE_DIR/wait-for-frps.sh"
 }
 
+# ---------------------------------------------------------------- firewall (ufw)
 setup_ufw_iran() {
-  local peer_ip="${1:-}"
-  command -v ufw >/dev/null 2>&1 || return 0
-  ufw status 2>/dev/null | head -n 1 | grep -qi 'Status: active' || return 0
-  if ! ufw status 2>/dev/null | grep -Eq "(^|[[:space:]])${FRPS_PORT}/tcp.*ALLOW"; then
+  local peer_ip="${1:-}" proto="${2:-tcp}" st
+  ufw_active || return 0
+  st="$(ufw status 2>/dev/null || true)"
+  if ! grep -Eq "(^|[[:space:]])${FRPS_PORT}/tcp.*ALLOW" <<<"$st"; then
     ufw allow "${FRPS_PORT}/tcp" comment 'xtcp-tun-managed' >/dev/null
     printf 'yes\n' > "$CONF_DIR/ufw_added_tcp_control"
     log "UFW: allowed TCP/$FRPS_PORT for the FRP control connection."
   fi
+  case "$proto" in
+    kcp|quic)
+      if ! grep -Eq "(^|[[:space:]])${FRPS_PORT}/udp.*ALLOW" <<<"$st"; then
+        ufw allow "${FRPS_PORT}/udp" comment 'xtcp-tun-managed' >/dev/null
+        printf 'yes\n' > "$CONF_DIR/ufw_added_udp_control"
+        log "UFW: allowed UDP/$FRPS_PORT (transport $proto)."
+      fi ;;
+  esac
   if [[ -n "$peer_ip" ]] && valid_ipv4 "$peer_ip"; then
-    if ! ufw status 2>/dev/null | grep -F "$peer_ip" | grep -q 'ALLOW'; then
+    if ! ufw_has_allow_for "$peer_ip"; then
       ufw allow from "$peer_ip" to any proto udp comment 'xtcp-tun-managed' >/dev/null
       ufw allow from "$peer_ip" to any port "$TCP_FALLBACK_PORT" proto tcp comment 'xtcp-tun-managed' >/dev/null
       ufw allow from "$peer_ip" to any port "$TCPMUX_PORT" proto tcp comment 'xtcp-tun-managed' >/dev/null
       printf '%s\n' "$peer_ip" > "$CONF_DIR/ufw_added_udp_peer"
-      log "UFW: allowed UDP (XTCP), TCP/$TCP_FALLBACK_PORT and TCP/$TCPMUX_PORT (tcp/tcpmux fallbacks) from the outside server's IP."
+      log "UFW: allowed UDP (XTCP) and TCP/$TCP_FALLBACK_PORT, TCP/$TCPMUX_PORT (fallbacks) from the outside server."
     fi
   else
-    warn "UFW is active; for XTCP, and the tcp/tcpmux fallbacks (ports $TCP_FALLBACK_PORT, $TCPMUX_PORT), to work, inbound UDP and those two TCP ports must be allowed from the outside server. On the Iran install, enter the outside server's public IP, or add the right rules manually."
+    warn "UFW is active: XTCP (UDP) and the tcp/tcpmux fallbacks (ports $TCP_FALLBACK_PORT, $TCPMUX_PORT) need inbound access from the outside server. Re-run the Iran install/repair and enter the outside server's IP, or add the rules by hand."
   fi
 }
 
 setup_ufw_outside() {
   local iran_ip="$1"
-  command -v ufw >/dev/null 2>&1 || return 0
-  ufw status 2>/dev/null | head -n 1 | grep -qi 'Status: active' || return 0
-  if ! ufw status 2>/dev/null | grep -F "$iran_ip" | grep -q 'ALLOW'; then
+  ufw_active || return 0
+  if ! ufw_has_allow_for "$iran_ip"; then
     ufw allow from "$iran_ip" to any proto udp comment 'xtcp-tun-managed' >/dev/null
     printf '%s\n' "$iran_ip" > "$CONF_DIR/ufw_added_udp_peer"
     log "UFW: allowed UDP from the Iran server's public IP."
   fi
+  # The forwarded services live behind this interface; without this rule UFW's
+  # default-deny drops every forwarded connection (v1 bug).
+  ufw allow in on "$TUN_DEV" comment 'xtcp-tun-managed' >/dev/null
+  printf 'yes\n' > "$CONF_DIR/ufw_added_tun_iface"
+  log "UFW: allowed inbound traffic on the tunnel interface $TUN_DEV."
+}
+
+# ---------------------------------------------------------------- systemd units
+make_rules_unit() {
+  cat > "$UNIT_DIR/xtcp-tun-rules.service" <<EOF2
+[Unit]
+Description=Persistent firewall / forwarding rules for XTCP-TUN
+After=network-online.target xtcp-tun-agent.service
+Wants=network-online.target xtcp-tun-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$MANAGER_PATH --apply-rules
+ExecReload=$MANAGER_PATH --apply-rules
+
+[Install]
+WantedBy=multi-user.target
+EOF2
 }
 
 make_iran_units() {
-  cat > /etc/systemd/system/xtcp-tun-frps.service <<EOF2
+  : "${PYTHON_BIN:=$(command -v python3)}"
+  cat > "$UNIT_DIR/xtcp-tun-frps.service" <<EOF2
 [Unit]
 Description=FRP server for XTCP-TUN
 After=network-online.target
@@ -797,17 +387,19 @@ ReadWritePaths=$LOG_DIR
 [Install]
 WantedBy=multi-user.target
 EOF2
-  cat > /etc/systemd/system/xtcp-tun-agent.service <<EOF2
+  cat > "$UNIT_DIR/xtcp-tun-agent.service" <<EOF2
 [Unit]
-Description=IPv4 TUN packet bridge over FRP XTCP (Iran)
+Description=IPv4 TUN packet bridge over FRP (Iran)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=notify
+RuntimeDirectory=xtcp-tun
 Environment=PYTHONUNBUFFERED=1
-ExecStart=$PYTHON_BIN $AGENT_PATH server --dev $TUN_DEV --cidr $IRAN_TUN_IP/30 --listen 127.0.0.1:$PIPE_SERVER_PORT --mtu $MTU
+ExecStartPre=-/usr/bin/env modprobe tun
+ExecStart=$PYTHON_BIN $AGENT_PATH server --dev $TUN_DEV --cidr $IRAN_TUN_IP/30 --listen 127.0.0.1:$PIPE_SERVER_PORT --mtu $MTU --secret-file $CONF_DIR/xtcp_secret --state-file $STATE_FILE
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -816,9 +408,9 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF2
-  cat > /etc/systemd/system/xtcp-tun-frpc-iran.service <<EOF2
+  cat > "$UNIT_DIR/xtcp-tun-frpc-iran.service" <<EOF2
 [Unit]
-Description=FRP XTCP proxy client (Iran side)
+Description=FRP proxy client (Iran side)
 After=network-online.target xtcp-tun-frps.service xtcp-tun-agent.service
 Requires=xtcp-tun-frps.service xtcp-tun-agent.service
 Wants=network-online.target
@@ -837,37 +429,25 @@ ReadWritePaths=$LOG_DIR
 [Install]
 WantedBy=multi-user.target
 EOF2
-  cat > /etc/systemd/system/xtcp-tun-rules.service <<EOF2
-[Unit]
-Description=Persistent iptables rules for XTCP-TUN port forwarding
-After=network-online.target xtcp-tun-agent.service
-Requires=xtcp-tun-agent.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=$MANAGER_PATH --apply-rules
-ExecReload=$MANAGER_PATH --apply-rules
-
-[Install]
-WantedBy=multi-user.target
-EOF2
+  make_rules_unit
 }
 
 make_outside_units() {
   local iran_ip="$1"
-  cat > /etc/systemd/system/xtcp-tun-agent.service <<EOF2
+  : "${PYTHON_BIN:=$(command -v python3)}"
+  cat > "$UNIT_DIR/xtcp-tun-agent.service" <<EOF2
 [Unit]
-Description=IPv4 TUN packet bridge over FRP XTCP (outside side)
+Description=IPv4 TUN packet bridge over FRP (outside side)
 After=network-online.target xtcp-tun-frpc-outside.service
 Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=notify
+RuntimeDirectory=xtcp-tun
 Environment=PYTHONUNBUFFERED=1
-ExecStart=$PYTHON_BIN $AGENT_PATH client --dev $TUN_DEV --cidr $OUTSIDE_TUN_IP/30 --connect 127.0.0.1:$PIPE_VISITOR_PORT --direct-tcp $iran_ip:$TCP_FALLBACK_PORT --tcpmux $iran_ip:$TCPMUX_PORT --tcpmux-host $TCPMUX_DOMAIN --mtu $MTU
+ExecStartPre=-/usr/bin/env modprobe tun
+ExecStart=$PYTHON_BIN $AGENT_PATH client --dev $TUN_DEV --cidr $OUTSIDE_TUN_IP/30 --connect 127.0.0.1:$PIPE_VISITOR_PORT --direct-tcp $iran_ip:$TCP_FALLBACK_PORT --tcpmux $iran_ip:$TCPMUX_PORT --tcpmux-host $TCPMUX_DOMAIN --mtu $MTU --secret-file $CONF_DIR/xtcp_secret --state-file $STATE_FILE
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -876,9 +456,9 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF2
-  cat > /etc/systemd/system/xtcp-tun-frpc-outside.service <<EOF2
+  cat > "$UNIT_DIR/xtcp-tun-frpc-outside.service" <<EOF2
 [Unit]
-Description=FRP XTCP visitor client (outside side)
+Description=FRP visitor client (outside side)
 After=network-online.target
 Wants=network-online.target
 
@@ -895,53 +475,42 @@ ReadWritePaths=$LOG_DIR
 [Install]
 WantedBy=multi-user.target
 EOF2
+  make_rules_unit
 }
 
-install_iran() {
-  require_root
-  [[ ! -f "$CONF_DIR/role" ]] || die "This manager is already installed on this server (role: $(cat "$CONF_DIR/role")). Check the status or uninstall first."
-  install_packages
-  local p
-  for p in "$FRPS_PORT" "$TCP_FALLBACK_PORT" "$TCPMUX_PORT"; do
-    if port_listening "$p"; then
-      die "Port $p is already in use by another process on this server (check with: ss -tlnp | grep :$p). This is almost always another service already bound there - most commonly another FRP-based tunnel script already installed on this same box, since its frps also defaults to port $FRPS_PORT unless changed. Stop that service/port first, or change \$FRPS_PORT/\$TCP_FALLBACK_PORT/\$TCPMUX_PORT near the top of this script, then try again."
-    fi
-  done
-  install_frp yes yes
-  write_agent
-  write_wait_for_frps_script
-  local detected iran_ip peer_ip frp_token xtcp_secret transport_protocol transport_bind_extra=""
-  detected="$(curl -4fsS --connect-timeout 5 --max-time 8 https://api.ipify.org 2>/dev/null || true)"
-  if ! valid_ipv4 "$detected"; then detected=""; fi
-  read -rp "Public IPv4 of the Iran server${detected:+ [$detected]}: " iran_ip
-  iran_ip="${iran_ip:-$detected}"
-  valid_ipv4 "$iran_ip" || die "No valid public IPv4 was entered."
-  read -rp "Public IPv4 of the outside server, to allow UDP if UFW is active (press Enter to skip): " peer_ip
-  if [[ -n "$peer_ip" ]] && ! valid_ipv4 "$peer_ip"; then die "The outside server's IP is not valid."; fi
-  choose_transport_protocol
-  transport_protocol="$CHOSEN_TRANSPORT_PROTOCOL"
-  case "$transport_protocol" in
-    kcp) transport_bind_extra="kcpBindPort = $FRPS_PORT"$'\n' ;;
-    quic) transport_bind_extra="quicBindPort = $FRPS_PORT"$'\n' ;;
-  esac
+# ---------------------------------------------------------------- config files
+# Writes everything that depends on the saved settings. Used by install AND repair.
+write_iran_files() {
+  local iran_ip="$1" proto="$2" frp_token xtcp_secret extra=""
   frp_token="$DEFAULT_FRP_TOKEN"
   xtcp_secret="$DEFAULT_XTCP_SECRET"
+  case "$proto" in
+    kcp) extra="kcpBindPort = $FRPS_PORT"$'\n' ;;
+    quic) extra="quicBindPort = $FRPS_PORT"$'\n' ;;
+  esac
+  mkdir -p "$CONF_DIR" "$LOG_DIR" "$(dirname "$UNIT_DIR/x")"
   printf 'iran\n' > "$CONF_DIR/role"
   printf '%s\n' "$iran_ip" > "$CONF_DIR/iran_public_ip"
   printf '%s\n' "$frp_token" > "$CONF_DIR/frp_token"
   printf '%s\n' "$xtcp_secret" > "$CONF_DIR/xtcp_secret"
-  printf '%s\n' "$transport_protocol" > "$CONF_DIR/transport_protocol"
+  printf '%s\n' "$proto" > "$CONF_DIR/transport_protocol"
   chmod 600 "$CONF_DIR"/*
-  : > "$CONF_DIR/forwards.tsv"
+  [[ -f "$CONF_DIR/forwards.tsv" ]] || : > "$CONF_DIR/forwards.tsv"
   if [[ ! -f "$CONF_DIR/old_ip_forward" ]]; then sysctl -n net.ipv4.ip_forward > "$CONF_DIR/old_ip_forward"; fi
   printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/90-xtcp-tun.conf
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  # allowPorts/maxPortsPerClient: the token is shared, so a stranger who knows it
+  # must not be able to open arbitrary public ports on this server.
   cat > "$CONF_DIR/frps.toml" <<EOF2
 bindAddr = "0.0.0.0"
 bindPort = $FRPS_PORT
-${transport_bind_extra}tcpmuxHTTPConnectPort = $TCPMUX_PORT
+${extra}tcpmuxHTTPConnectPort = $TCPMUX_PORT
 auth.method = "token"
 auth.token = "$frp_token"
+allowPorts = [ { start = $TCP_FALLBACK_PORT, end = $TCP_FALLBACK_PORT } ]
+maxPortsPerClient = 1
+transport.heartbeatTimeout = 30
+transport.tcpKeepalive = 30
 log.to = "$LOG_DIR/frps.log"
 log.level = "info"
 log.maxDays = 3
@@ -949,7 +518,9 @@ EOF2
   cat > "$CONF_DIR/frpc-iran.toml" <<EOF2
 serverAddr = "127.0.0.1"
 serverPort = $FRPS_PORT
-transport.protocol = "$transport_protocol"
+transport.protocol = "$proto"
+transport.heartbeatInterval = 10
+transport.heartbeatTimeout = 30
 natHoleStunServer = "$NAT_HOLE_STUN_SERVER"
 auth.method = "token"
 auth.token = "$frp_token"
@@ -957,6 +528,7 @@ log.to = "$LOG_DIR/frpc-iran.log"
 log.level = "info"
 log.maxDays = 3
 
+# Direct P2P path (UDP hole punching).
 [[proxies]]
 name = "xtcp-l3"
 type = "xtcp"
@@ -964,9 +536,7 @@ secretKey = "$xtcp_secret"
 localIP = "127.0.0.1"
 localPort = $PIPE_SERVER_PORT
 
-# Guaranteed relay-through-frps path, used automatically whenever direct
-# XTCP hole punching (quic or kcp, see frpc-outside.toml) fails or times
-# out. Same local target as the xtcp proxy above.
+# Relay-through-frps path (always works while the control connection is up).
 [[proxies]]
 name = "xtcp-l3-stcp"
 type = "stcp"
@@ -974,12 +544,7 @@ secretKey = "$xtcp_secret"
 localIP = "127.0.0.1"
 localPort = $PIPE_SERVER_PORT
 
-# Direct public-port fallback, reachable without going through frpc's own
-# control connection at all (see run_client's --direct-tcp on the outside
-# agent). No secretKey gating - restricted to the outside server's IP via
-# ufw by setup_ufw_iran when that IP is known. This leg also carries the
-# tunneled packets without any frp-level payload encryption (see the
-# TCP_FALLBACK_PORT/TCPMUX_PORT comment near the top of this script).
+# Public-port fallback; the agent handshake authenticates whoever connects.
 [[proxies]]
 name = "xtcp-l3-tcp"
 type = "tcp"
@@ -987,10 +552,7 @@ localIP = "127.0.0.1"
 localPort = $PIPE_SERVER_PORT
 remotePort = $TCP_FALLBACK_PORT
 
-# Same idea, but reached via an HTTP CONNECT request to frps's tcpmux
-# port, so on the wire it looks like ordinary HTTPS forward-proxy traffic.
-# No secretKey gating here either - same ufw restriction as above applies,
-# and the same "no frp-level payload encryption" caveat applies too.
+# Same, via an HTTP CONNECT to frps's tcpmux port.
 [[proxies]]
 name = "xtcp-l3-tcpmux"
 type = "tcpmux"
@@ -1001,64 +563,51 @@ localPort = $PIPE_SERVER_PORT
 EOF2
   chmod 600 "$CONF_DIR"/*.toml
   make_iran_units
-  setup_ufw_iran "$peer_ip"
-  systemctl daemon-reload
-  systemctl enable --now xtcp-tun-frps.service xtcp-tun-agent.service xtcp-tun-frpc-iran.service xtcp-tun-rules.service
-  log "Iran-side install complete. Use this information to connect the outside server:"
-  printf '\n  Iran IP:        %s\n  FRP Token:      %s\n  XTCP SecretKey: %s\n  Protocol:       %s\n\n' "$iran_ip" "$frp_token" "$xtcp_secret" "$transport_protocol"
-  printf 'Also open inbound TCP ports %s (control), %s (tcp fallback) and %s (tcpmux fallback) in the Iran datacenter'"'"'s firewall panel - ideally restricted to the outside server'"'"'s IP.\n' "$FRPS_PORT" "$TCP_FALLBACK_PORT" "$TCPMUX_PORT"
-  printf 'Now run this same script on the outside server, choose option 2, and pick the same protocol (%s) when asked.\n' "$transport_protocol"
-
-  log "Waiting for the tunnel interface ($TUN_DEV) to come up..."
-  local tun_wait=0
-  until ip link show dev "$TUN_DEV" >/dev/null 2>&1; do
-    sleep 1
-    tun_wait=$((tun_wait + 1))
-    if (( tun_wait >= 20 )); then
-      warn "Tunnel interface $TUN_DEV is not up yet; add port forwards later from menu option 7 once it is (check option 3 for status)."
-      return 0
-    fi
-  done
-  prompt_initial_forwards
 }
 
-install_outside() {
-  require_root
-  [[ ! -f "$CONF_DIR/role" ]] || die "This manager is already installed on this server (role: $(cat "$CONF_DIR/role")). Check the status or uninstall first."
-  install_packages
-  install_frp yes no
-  write_agent
-  local iran_ip frp_token xtcp_secret transport_protocol
-  read -rp "Public IPv4 of the Iran server: " iran_ip
-  valid_ipv4 "$iran_ip" || die "The Iran server's public IPv4 is not valid."
-  choose_transport_protocol
-  transport_protocol="$CHOSEN_TRANSPORT_PROTOCOL"
+write_outside_files() {
+  local iran_ip="$1" proto="$2" mode="$3" frp_token xtcp_secret
   frp_token="$DEFAULT_FRP_TOKEN"
   xtcp_secret="$DEFAULT_XTCP_SECRET"
+  mkdir -p "$CONF_DIR" "$LOG_DIR"
   printf 'outside\n' > "$CONF_DIR/role"
   printf '%s\n' "$iran_ip" > "$CONF_DIR/iran_public_ip"
   printf '%s\n' "$frp_token" > "$CONF_DIR/frp_token"
   printf '%s\n' "$xtcp_secret" > "$CONF_DIR/xtcp_secret"
-  printf '%s\n' "$transport_protocol" > "$CONF_DIR/transport_protocol"
+  printf '%s\n' "$proto" > "$CONF_DIR/transport_protocol"
+  printf '%s\n' "$mode" > "$CONF_DIR/mode"
   chmod 600 "$CONF_DIR"/*
   cat > "$CONF_DIR/frpc-outside.toml" <<EOF2
 serverAddr = "$iran_ip"
 serverPort = $FRPS_PORT
-transport.protocol = "$transport_protocol"
+transport.protocol = "$proto"
+transport.heartbeatInterval = 10
+transport.heartbeatTimeout = 30
 natHoleStunServer = "$NAT_HOLE_STUN_SERVER"
 auth.method = "token"
 auth.token = "$frp_token"
 log.to = "$LOG_DIR/frpc-outside.log"
 log.level = "info"
 log.maxDays = 3
+EOF2
+  if [[ "$mode" == relay ]]; then
+    cat >> "$CONF_DIR/frpc-outside.toml" <<EOF2
 
-# tun-agent.py connects to 127.0.0.1:$PIPE_VISITOR_PORT, which this first
-# visitor binds. Whichever of the three ends up succeeding (direct XTCP
-# over QUIC, direct XTCP over KCP, or the relayed STCP fallback) is
-# transparent to it - it always sees one plain local TCP connection.
+# relay mode: one TCP visitor through frps, no UDP / STUN involved.
+[[visitors]]
+name = "xtcp-l3-stcp-visitor"
+type = "stcp"
+serverName = "xtcp-l3-stcp"
+secretKey = "$xtcp_secret"
+bindAddr = "127.0.0.1"
+bindPort = $PIPE_VISITOR_PORT
+EOF2
+  else
+    cat >> "$CONF_DIR/frpc-outside.toml" <<EOF2
 
-# 1) Try direct P2P over QUIC first (lowest overhead/latency when hole
-#    punching succeeds).
+# tun-agent connects to 127.0.0.1:$PIPE_VISITOR_PORT (bound by the first visitor).
+# Whichever of quic / kcp / relayed stcp succeeds is transparent to it.
+# 1) direct P2P over QUIC
 [[visitors]]
 name = "xtcp-l3-visitor-quic"
 type = "xtcp"
@@ -1073,9 +622,7 @@ minRetryInterval = 15
 fallbackTo = "xtcp-l3-visitor-kcp"
 fallbackTimeoutMs = $XTCP_FALLBACK_TIMEOUT_MS
 
-# 2) If QUIC hole punching doesn't succeed in time, try direct P2P over
-#    KCP - a different NAT type/path sometimes gets through when QUIC
-#    doesn't, or vice versa.
+# 2) direct P2P over KCP
 [[visitors]]
 name = "xtcp-l3-visitor-kcp"
 type = "xtcp"
@@ -1089,11 +636,7 @@ minRetryInterval = 15
 fallbackTo = "xtcp-l3-stcp-visitor"
 fallbackTimeoutMs = $XTCP_FALLBACK_TIMEOUT_MS
 
-# 3) Guaranteed path: relayed through frps on the Iran server like a
-#    normal tunnel. No NAT traversal needed, so this always works as
-#    long as the control connection to frps is up; it's only slightly
-#    slower than a successful direct XTCP connection, since frps and the
-#    Iran-side proxy are on the very same host.
+# 3) guaranteed path: relayed through frps
 [[visitors]]
 name = "xtcp-l3-stcp-visitor"
 type = "stcp"
@@ -1101,97 +644,114 @@ serverName = "xtcp-l3-stcp"
 secretKey = "$xtcp_secret"
 bindPort = -1
 EOF2
+  fi
   chmod 600 "$CONF_DIR"/*.toml
   make_outside_units "$iran_ip"
-  setup_ufw_outside "$iran_ip"
-  systemctl daemon-reload
-  systemctl enable --now xtcp-tun-frpc-outside.service xtcp-tun-agent.service
-  log "Outside-side install complete. Check the status after a few seconds."
-  printf 'Iran tunnel IP:    %s\nOutside tunnel IP: %s\nProtocol:          %s\n' "$IRAN_TUN_IP" "$OUTSIDE_TUN_IP" "$transport_protocol"
-  printf 'Once XTCP NAT traversal succeeds, IP packets will pass through the %s interface.\n' "$TUN_DEV"
-  printf 'Make sure TCP ports %s, %s and %s are open on the Iran server (datacenter firewall + ufw).\n' "$FRPS_PORT" "$TCP_FALLBACK_PORT" "$TCPMUX_PORT"
-  if [[ "$transport_protocol" != "tcp" ]]; then
-    warn "Double-check the Iran server was also installed with protocol=$transport_protocol (menu option 10 there shows it); a mismatch here is a common reason the tunnel never connects."
+}
+
+# ---------------------------------------------------------------- pre-flight checks
+# Warns when the tunnel /30 collides with something already on this server
+# (an address/route in the same range, or a gateway equal to a tunnel IP).
+check_tun_subnet() {
+  local problems
+  problems="$(python3 - "$TUN_DEV" "$IRAN_TUN_IP" "$OUTSIDE_TUN_IP" <<'PY' 2>/dev/null || true
+import ipaddress, subprocess, sys
+dev, a, b = sys.argv[1:4]
+net = ipaddress.ip_network(f"{a}/30", strict=False)
+ours = {ipaddress.ip_address(a), ipaddress.ip_address(b)}
+bad = []
+for line in subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True).stdout.splitlines():
+    f = line.split()
+    if len(f) < 4 or f[1] == dev:
+        continue
+    try:
+        if ipaddress.ip_interface(f[3]).network.overlaps(net):
+            bad.append(f"interface {f[1]} has {f[3]}")
+    except ValueError:
+        pass
+for line in subprocess.run(["ip", "-4", "route", "show", "table", "all"], capture_output=True, text=True).stdout.splitlines():
+    f = line.split()
+    if not f or f[0] in ("local", "broadcast", "multicast", "unreachable", "blackhole", "prohibit", "throw"):
+        continue
+    if "dev" in f and f[f.index("dev") + 1] == dev:
+        continue
+    if "via" in f:
+        try:
+            if ipaddress.ip_address(f[f.index("via") + 1]) in ours:
+                bad.append("route uses a tunnel IP as gateway: " + line.strip())
+        except ValueError:
+            pass
+    if f[0] != "default":
+        try:
+            n = ipaddress.ip_network(f[0] if "/" in f[0] else f[0] + "/32", strict=False)
+        except ValueError:
+            continue
+        if n.prefixlen >= 16 and n.overlaps(net):
+            bad.append("route " + line.strip())
+print("\n".join(dict.fromkeys(bad)))
+PY
+)"
+  [[ -z "$problems" ]] && return 0
+  warn "The tunnel subnet $IRAN_TUN_IP/30 overlaps with something on this server:"
+  printf '  %s\n' "$problems" >&2
+  printf 'Pinging the peer would silently fail (or this server could lose connectivity).\nTo use another subnet, change IRAN_TUN_IP / OUTSIDE_TUN_IP at the top of this script - identically on BOTH servers.\n' >&2
+  return 1
+}
+
+stop_leftover_services() {
+  local s
+  for s in xtcp-tun-rules xtcp-tun-frpc-iran xtcp-tun-frpc-outside xtcp-tun-agent xtcp-tun-frps; do
+    systemctl stop "$s.service" >/dev/null 2>&1 || true
+  done
+}
+
+# ---------------------------------------------------------------- status / tests
+agent_state_line() {
+  python3 - "$STATE_FILE" <<'PY' 2>/dev/null || printf 'unknown||0|0|0||9999\n'
+import json, sys, time
+d = json.load(open(sys.argv[1]))
+now = int(time.time())
+print("|".join(str(x) for x in (d.get("state", "?"), d.get("path", ""), now - int(d.get("since", now)),
+      d.get("rx_packets", 0), d.get("tx_packets", 0), str(d.get("last_error", "")).replace("|", "/"),
+      now - int(d.get("updated", 0)))))
+PY
+}
+
+print_agent_state() {
+  local st path dur rx tx err age
+  IFS='|' read -r st path dur rx tx err age <<<"$(agent_state_line)"
+  if [[ "$st" == unknown ]]; then
+    printf '  agent state: unknown (agent not running yet? see option 11)\n'
+    return 0
+  fi
+  printf '  agent state: %s' "$st"
+  [[ -z "$path" ]] || printf ' | path: %s | for %ss' "$path" "$dur"
+  printf ' | packets rx %s / tx %s' "$rx" "$tx"
+  (( age <= 30 )) || printf ' | (state file is %ss old - agent stuck?)' "$age"
+  printf '\n'
+  [[ -z "$err" ]] || printf '  last problem: %s\n' "$err"
+  if [[ "$path" == direct-tcp || "$path" == tcpmux ]]; then
+    printf '  note: this fallback path is NOT encrypted; the frp path (visitor) is the preferred one.\n'
   fi
 }
 
-ipt() { iptables -w "$@"; }
-
-apply_rules() {
-  require_root
-  [[ -f "$CONF_DIR/role" && "$(cat "$CONF_DIR/role")" == iran ]] || { log "Forwarding rules only apply on the Iran role."; return 0; }
-  command -v iptables >/dev/null 2>&1 || die "iptables is not installed."
-  if ! wait_for_tun_interface; then
-    local tun_hint=""
-    [[ -e /dev/net/tun ]] || tun_hint=" /dev/net/tun does not exist on this system - TUN is unavailable here (common on some virtualized/container hosts, which may need this enabled by the hosting provider; see the warning at install time)."
-    die "Interface $TUN_DEV still does not exist after waiting 15s.${tun_hint} Check: systemctl status xtcp-tun-agent.service, and menu option 11 (logs) for the agent's own error - it logs straight to journald, not a file."
+# Prints "OK" and returns 0 when the peer answers a ping through the tunnel.
+ping_peer() {
+  local peer out recv
+  peer="$(peer_tun_ip)"
+  [[ -n "$peer" ]] || return 1
+  command -v ping >/dev/null 2>&1 || { printf '  ping is not installed (apt-get install iputils-ping)\n'; return 1; }
+  out="$(ping -c 3 -W 2 "$peer" 2>&1 || true)"
+  recv="$(grep -Eo '[0-9]+ (packets )?received' <<<"$out" | grep -Eo '^[0-9]+' || true)"
+  if [[ -n "$recv" && "$recv" -gt 0 ]]; then
+    printf '  ping %s through the tunnel: OK (%s/3 replies)\n' "$peer" "$recv"
+    return 0
   fi
-  local wan
-  wan="$(ip -4 route show default | awk 'NR==1 {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
-  [[ -n "$wan" ]] || wan="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
-  [[ -n "$wan" ]] || die "Could not detect the WAN interface from the routing table."
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  ipt -t nat -N XTCP_TUN_DNAT 2>/dev/null || true
-  ipt -t nat -N XTCP_TUN_SNAT 2>/dev/null || true
-  ipt -N XTCP_TUN_FWD 2>/dev/null || true
-  ipt -t mangle -N XTCP_TUN_MSS 2>/dev/null || true
-  ipt -t nat -F XTCP_TUN_DNAT
-  ipt -t nat -F XTCP_TUN_SNAT
-  ipt -F XTCP_TUN_FWD
-  ipt -t mangle -F XTCP_TUN_MSS
-  ipt -t nat -C PREROUTING -j XTCP_TUN_DNAT 2>/dev/null || ipt -t nat -I PREROUTING 1 -j XTCP_TUN_DNAT
-  ipt -t nat -C POSTROUTING -o "$TUN_DEV" -j XTCP_TUN_SNAT 2>/dev/null || ipt -t nat -I POSTROUTING 1 -o "$TUN_DEV" -j XTCP_TUN_SNAT
-  ipt -C FORWARD -j XTCP_TUN_FWD 2>/dev/null || ipt -I FORWARD 1 -j XTCP_TUN_FWD
-  ipt -t mangle -C FORWARD -j XTCP_TUN_MSS 2>/dev/null || ipt -t mangle -I FORWARD 1 -j XTCP_TUN_MSS
-  if ! ipt -t mangle -A XTCP_TUN_MSS -o "$TUN_DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TUNNEL_MSS"; then
-    warn "Could not add TCP MSS clamp for outbound tunnel traffic; if some sites fail to load, check MTU/MSS."
-  fi
-  if ! ipt -t mangle -A XTCP_TUN_MSS -i "$TUN_DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TUNNEL_MSS"; then
-    warn "Could not add TCP MSS clamp for inbound tunnel traffic; if some sites fail to load, check MTU/MSS."
-  fi
-  ipt -t mangle -A XTCP_TUN_MSS -j RETURN
-  ipt -A XTCP_TUN_FWD -i "$TUN_DEV" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  local proto listen target
-  while read -r proto listen target; do
-    [[ -n "${proto:-}" ]] || continue
-    [[ "$proto" == tcp || "$proto" == udp ]] || continue
-    valid_port "$listen" && valid_port "$target" || continue
-    if [[ "$listen" == "$FRPS_PORT" ]]; then
-      warn "Skipping forward for port $FRPS_PORT: reserved for the FRP control channel."
-      continue
-    fi
-    # Defense in depth: also refuse the two outside-agent fallback ports
-    # here, in case forwards.tsv has a stale entry from before this check
-    # existed in add_forward()/prompt_initial_forwards(). DNAT runs before
-    # local delivery, so a forward on either of these would silently
-    # divert traffic away from frps's own fallback listeners.
-    if is_reserved_port "$listen"; then
-      warn "Skipping forward for port $listen: reserved for this script's own control/fallback channels (FRP control: $FRPS_PORT, TCP fallback: $TCP_FALLBACK_PORT, TCPMUX fallback: $TCPMUX_PORT)."
-      continue
-    fi
-    ipt -t nat -A XTCP_TUN_DNAT -i "$wan" -p "$proto" --dport "$listen" -j DNAT --to-destination "$OUTSIDE_TUN_IP:$target"
-    ipt -t nat -A XTCP_TUN_SNAT -d "$OUTSIDE_TUN_IP" -p "$proto" --dport "$target" -j SNAT --to-source "$IRAN_TUN_IP"
-    ipt -A XTCP_TUN_FWD -i "$wan" -o "$TUN_DEV" -d "$OUTSIDE_TUN_IP" -p "$proto" --dport "$target" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
-  done < "$CONF_DIR/forwards.tsv"
-  ipt -A XTCP_TUN_FWD -j RETURN
-  log "Rules applied. WAN=$wan; DNAT targets $OUTSIDE_TUN_IP and replies are SNATed from $IRAN_TUN_IP; TCP MSS fixed at $TUNNEL_MSS for tunnel traffic."
+  printf '  ping %s through the tunnel: NO REPLY\n' "$peer"
+  return 1
 }
 
-remove_iptables_rules() {
-  command -v iptables >/dev/null 2>&1 || return 0
-  while ipt -t nat -C PREROUTING -j XTCP_TUN_DNAT 2>/dev/null; do ipt -t nat -D PREROUTING -j XTCP_TUN_DNAT || break; done
-  while ipt -t nat -C POSTROUTING -o "$TUN_DEV" -j XTCP_TUN_SNAT 2>/dev/null; do ipt -t nat -D POSTROUTING -o "$TUN_DEV" -j XTCP_TUN_SNAT || break; done
-  while ipt -C FORWARD -j XTCP_TUN_FWD 2>/dev/null; do ipt -D FORWARD -j XTCP_TUN_FWD || break; done
-  while ipt -t mangle -C FORWARD -j XTCP_TUN_MSS 2>/dev/null; do ipt -t mangle -D FORWARD -j XTCP_TUN_MSS || break; done
-  ipt -t mangle -F XTCP_TUN_MSS 2>/dev/null || true
-  ipt -t mangle -X XTCP_TUN_MSS 2>/dev/null || true
-  ipt -t nat -F XTCP_TUN_DNAT 2>/dev/null || true
-  ipt -t nat -X XTCP_TUN_DNAT 2>/dev/null || true
-  ipt -t nat -F XTCP_TUN_SNAT 2>/dev/null || true
-  ipt -t nat -X XTCP_TUN_SNAT 2>/dev/null || true
-  ipt -F XTCP_TUN_FWD 2>/dev/null || true
-  ipt -X XTCP_TUN_FWD 2>/dev/null || true
-}
+tcp_probe() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" >/dev/null 2>&1; }
 
 status_all() {
   require_root
@@ -1199,90 +759,318 @@ status_all() {
     printf 'Status: not installed\n'
     return 0
   fi
-  printf '\nRole: %s\n' "$(cat "$CONF_DIR/role")"
-  if [[ -f "$CONF_DIR/transport_protocol" ]]; then
-    printf 'Transport protocol: %s\n' "$(cat "$CONF_DIR/transport_protocol")"
-  fi
-  printf '\n--- Tunnel interface IP ---\n'
+  local role s
+  role="$(get_role)"
+  printf '\nRole: %s   (script v%s)\n' "$role" "$SCRIPT_VERSION"
+  if [[ -f "$CONF_DIR/transport_protocol" ]]; then printf 'Transport protocol: %s\n' "$(cat "$CONF_DIR/transport_protocol")"; fi
+  if [[ -f "$CONF_DIR/mode" ]]; then printf 'Path mode: %s\n' "$(cat "$CONF_DIR/mode")"; fi
+  printf '\n--- Tunnel interface ---\n'
   if ! ip -4 addr show dev "$TUN_DEV" 2>/dev/null; then
     printf '  Interface %s does not exist yet.\n' "$TUN_DEV"
-    [[ -e /dev/net/tun ]] || printf '  /dev/net/tun does not exist on this system - TUN is unavailable, which is why the interface cannot be created (try: modprobe tun; if that does not help, this may need to be enabled by the hosting provider).\n'
+    if [[ ! -e /dev/net/tun ]]; then printf '  /dev/net/tun does not exist - TUN is unavailable (try: modprobe tun; on a container the provider must enable it).\n'; fi
   fi
   printf '\n--- Services ---\n'
-  local s
   for s in xtcp-tun-frps xtcp-tun-agent xtcp-tun-frpc-iran xtcp-tun-frpc-outside xtcp-tun-rules; do
     if systemctl list-unit-files "$s.service" --no-legend 2>/dev/null | grep -q "$s.service"; then
       printf '%-30s %s\n' "$s" "$(systemctl is-active "$s.service" 2>/dev/null || true)"
     fi
   done
+  printf '\n--- Tunnel agent ---\n'
+  print_agent_state
+  ping_peer || true
   printf '\n--- Listening ports (local) ---\n'
   if ! ss -tlnp 2>/dev/null | grep -E ":($FRPS_PORT|$PIPE_SERVER_PORT|$PIPE_VISITOR_PORT|$TCP_FALLBACK_PORT|$TCPMUX_PORT)\b"; then
-    printf '  None of the expected ports are listening yet - the relevant service(s) have not actually bound their port; check option 11 (logs). If frps itself is missing here, something else may already be holding $FRPS_PORT.\n'
+    printf '  None of the expected ports is listening yet - check option 11 (logs).\n'
   fi
-  printf '\n--- Related connections ---\n'
-  ss -tnp 2>/dev/null | grep -E ":($FRPS_PORT|$PIPE_SERVER_PORT|$PIPE_VISITOR_PORT|$TCP_FALLBACK_PORT|$TCPMUX_PORT)\b" || true
-  if [[ "$(cat "$CONF_DIR/role")" == iran ]]; then
+  if [[ "$role" == iran ]]; then
     printf '\n--- Registered forwards (protocol listen-port target-port) ---\n'
     if [[ -s "$CONF_DIR/forwards.tsv" ]]; then sed 's/^/  /' "$CONF_DIR/forwards.tsv"; else printf '  No ports defined yet.\n'; fi
     printf '\n--- iptables NAT ---\n'
     ipt -t nat -S XTCP_TUN_DNAT 2>/dev/null || true
     ipt -t nat -S XTCP_TUN_SNAT 2>/dev/null || true
   fi
+  printf '\n--- Firewall rules for the tunnel interface ---\n'
+  ipt -S XTCP_TUN_IN 2>/dev/null || printf '  chain XTCP_TUN_IN missing - run option 6 (restart) or 14 (repair)\n'
+}
+
+test_tunnel() {
+  require_root
+  [[ -f "$CONF_DIR/role" ]] || die "Not installed yet."
+  local role iran_ip p ok_ping=no st path dur rx tx err age
+  role="$(get_role)"
+  printf '\n=== Tunnel test (%s side) ===\n' "$role"
+  print_agent_state
+  IFS='|' read -r st path dur rx tx err age <<<"$(agent_state_line)"
+  if [[ "$role" == outside ]]; then
+    iran_ip="$(cat "$CONF_DIR/iran_public_ip")"
+    printf '\nTCP reachability of the Iran server (%s):\n' "$iran_ip"
+    for p in "$FRPS_PORT:frps control" "$TCP_FALLBACK_PORT:tcp fallback" "$TCPMUX_PORT:tcpmux fallback"; do
+      if tcp_probe "$iran_ip" "${p%%:*}"; then printf '  %-6s %-16s open\n' "${p%%:*}" "${p#*:}"; else printf '  %-6s %-16s BLOCKED / closed\n' "${p%%:*}" "${p#*:}"; fi
+    done
+  else
+    printf '\nLocal listeners on this (Iran) server:\n'
+    for p in "$FRPS_PORT:frps control" "$TCPMUX_PORT:tcpmux" "$PIPE_SERVER_PORT:agent"; do
+      if port_listening "${p%%:*}"; then printf '  %-6s %-16s listening\n' "${p%%:*}" "${p#*:}"; else printf '  %-6s %-16s NOT listening\n' "${p%%:*}" "${p#*:}"; fi
+    done
+  fi
+  printf '\n'
+  if ping_peer; then ok_ping=yes; fi
+  printf '\n'
+  if [[ "$ok_ping" == yes ]]; then
+    log "Tunnel is working."
+    return 0
+  fi
+  printf 'Diagnosis hints:\n'
+  if [[ "$st" != connected ]]; then
+    printf '  - The two agents are not connected yet (state: %s).\n' "$st"
+    if [[ "$role" == outside ]]; then
+      printf '    Check the TCP reachability list above: if every Iran port is BLOCKED, the Iran firewall / provider blocks this server.\n'
+      printf '    Then read option 11 (logs): frpc-outside must say "login to server success".\n'
+    else
+      printf '    Run the same test on the outside server and read option 11 (logs).\n'
+    fi
+    printf '    "Rejected a connection: bad credentials" in the agent log means the two servers use different secrets.\n'
+  else
+    printf '  - The agents are connected but ping gets no reply: check the firewall on BOTH servers.\n'
+    printf '    Option 6 (restart) / 14 (repair) re-applies the rule that accepts traffic on %s. Also check "iptables -S INPUT" and any provider-level firewall rules.\n' "$TUN_DEV"
+  fi
+  if ufw_active; then printf '  - UFW is active on this server (the script manages its rules).\n'; fi
+  return 1
+}
+
+# ---------------------------------------------------------------- install
+install_iran() {
+  require_root
+  [[ ! -f "$CONF_DIR/role" ]] || die "This manager is already installed here (role: $(get_role)). Use option 14 to repair/upgrade, or uninstall first."
+  stop_leftover_services
+  install_packages
+  local p
+  for p in "$FRPS_PORT" "$TCP_FALLBACK_PORT" "$TCPMUX_PORT" "$PIPE_SERVER_PORT"; do
+    if port_listening "$p"; then
+      die "Port $p is already in use by another process (check: ss -tlnp | grep :$p) - most likely another FRP based tunnel script on this same box. Stop it, or change the ports at the top of this script, then try again."
+    fi
+  done
+  if ! check_tun_subnet; then
+    local c
+    read -rp "Continue anyway? Type YES to continue: " c
+    [[ "$c" == YES ]] || die "Cancelled because of the subnet conflict."
+  fi
+  install_frp yes yes
+  write_agent
+  write_wait_for_frps_script
+  local detected iran_ip peer_ip
+  detected="$(curl -4fsS --connect-timeout 5 --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  valid_ipv4 "$detected" || detected=""
+  read -rp "Public IPv4 of the Iran server${detected:+ [$detected]}: " iran_ip
+  iran_ip="${iran_ip:-$detected}"
+  valid_ipv4 "$iran_ip" || die "No valid public IPv4 was entered."
+  read -rp "Public IPv4 of the outside server (used for the UFW rules; press Enter to skip): " peer_ip
+  if [[ -n "$peer_ip" ]] && ! valid_ipv4 "$peer_ip"; then die "The outside server's IP is not valid."; fi
+  choose_transport_protocol
+  write_iran_files "$iran_ip" "$CHOSEN_TRANSPORT_PROTOCOL"
+  setup_ufw_iran "$peer_ip" "$CHOSEN_TRANSPORT_PROTOCOL"
+  systemctl daemon-reload
+  systemctl enable --now xtcp-tun-frps.service xtcp-tun-agent.service xtcp-tun-frpc-iran.service xtcp-tun-rules.service
+  log "Iran-side install complete. Use this information on the outside server:"
+  printf '\n  Iran IP:        %s\n  FRP Token:      %s\n  XTCP SecretKey: %s\n  Protocol:       %s\n\n' "$iran_ip" "$DEFAULT_FRP_TOKEN" "$DEFAULT_XTCP_SECRET" "$CHOSEN_TRANSPORT_PROTOCOL"
+  printf 'Open inbound TCP ports %s (control), %s (tcp fallback) and %s (tcpmux fallback) in the datacenter firewall panel too - ideally only for the outside server.\n' "$FRPS_PORT" "$TCP_FALLBACK_PORT" "$TCPMUX_PORT"
+  printf 'Now run this script on the outside server, choose option 2 and pick the same protocol (%s).\n' "$CHOSEN_TRANSPORT_PROTOCOL"
+  log "Waiting for the tunnel interface ($TUN_DEV) to come up..."
+  if wait_for_tun_interface 20; then
+    prompt_initial_forwards
+  else
+    warn "Tunnel interface $TUN_DEV is not up yet; add port forwards later from option 7 (see option 3 / 11)."
+  fi
+}
+
+install_outside() {
+  require_root
+  [[ ! -f "$CONF_DIR/role" ]] || die "This manager is already installed here (role: $(get_role)). Use option 14 to repair/upgrade, or uninstall first."
+  stop_leftover_services
+  install_packages
+  if port_listening "$PIPE_VISITOR_PORT"; then
+    die "Port $PIPE_VISITOR_PORT is already in use by another process (check: ss -tlnp | grep :$PIPE_VISITOR_PORT)."
+  fi
+  if ! check_tun_subnet; then
+    local c
+    read -rp "Continue anyway? Type YES to continue: " c
+    [[ "$c" == YES ]] || die "Cancelled because of the subnet conflict."
+  fi
+  install_frp yes no
+  write_agent
+  local iran_ip
+  read -rp "Public IPv4 of the Iran server: " iran_ip
+  valid_ipv4 "$iran_ip" || die "The Iran server's public IPv4 is not valid."
+  choose_transport_protocol
+  choose_mode
+  write_outside_files "$iran_ip" "$CHOSEN_TRANSPORT_PROTOCOL" "$CHOSEN_MODE"
+  setup_ufw_outside "$iran_ip"
+  systemctl daemon-reload
+  systemctl enable --now xtcp-tun-frpc-outside.service xtcp-tun-agent.service xtcp-tun-rules.service
+  log "Outside-side install complete. Waiting up to 40s for the tunnel to come up..."
+  local i st path dur rx tx err age
+  for i in $(seq 1 20); do
+    IFS='|' read -r st path dur rx tx err age <<<"$(agent_state_line)"
+    [[ "$st" == connected ]] && break
+    sleep 2
+  done
+  printf 'Iran tunnel IP:    %s\nOutside tunnel IP: %s\nProtocol:          %s\n' "$IRAN_TUN_IP" "$OUTSIDE_TUN_IP" "$CHOSEN_TRANSPORT_PROTOCOL"
+  test_tunnel || true
+}
+
+# Re-creates agent, configs, units and firewall rules from the saved settings.
+# Use it to upgrade an older install in place (run it on BOTH servers).
+repair_all() {
+  require_root
+  [[ -f "$CONF_DIR/role" ]] || die "Not installed yet - use option 1 or 2."
+  local role iran_ip proto mode
+  role="$(get_role)"
+  iran_ip="$(cat "$CONF_DIR/iran_public_ip")"
+  proto="$(cat "$CONF_DIR/transport_protocol" 2>/dev/null || true)"; proto="${proto:-tcp}"
+  mode="$(cat "$CONF_DIR/mode" 2>/dev/null || true)"; mode="${mode:-auto}"
+  command -v python3 >/dev/null 2>&1 || die "python3 is required."
+  PYTHON_BIN="$(command -v python3)"
+  ensure_tun_device
+  install_self_copy
+  write_agent
+  if [[ "$role" == iran ]]; then
+    write_wait_for_frps_script
+    write_iran_files "$iran_ip" "$proto"
+    setup_ufw_iran "" "$proto"
+  else
+    write_outside_files "$iran_ip" "$proto" "$mode"
+    setup_ufw_outside "$iran_ip"
+  fi
+  systemctl daemon-reload
+  if [[ "$role" == iran ]]; then
+    systemctl enable xtcp-tun-frps.service xtcp-tun-agent.service xtcp-tun-frpc-iran.service xtcp-tun-rules.service >/dev/null 2>&1
+    systemctl restart xtcp-tun-frps.service xtcp-tun-agent.service xtcp-tun-frpc-iran.service xtcp-tun-rules.service
+  else
+    systemctl enable xtcp-tun-frpc-outside.service xtcp-tun-agent.service xtcp-tun-rules.service >/dev/null 2>&1
+    systemctl restart xtcp-tun-frpc-outside.service xtcp-tun-agent.service xtcp-tun-rules.service
+  fi
+  log "Repair/upgrade finished (role: $role, protocol: $proto). Run the same option on the other server, then use option 13."
+}
+
+# ---------------------------------------------------------------- firewall / forwarding
+ipt() { iptables -w "$@"; }
+
+# Applies (re-applies) every firewall rule this script owns. Returns non-zero on
+# failure - it never relies on `set -e` (which is disabled inside `if apply_rules`).
+apply_rules() {
+  require_root
+  local role
+  role="$(get_role)"
+  [[ -n "$role" ]] || { log "Not installed; nothing to apply."; return 0; }
+  command -v iptables >/dev/null 2>&1 || { warn "iptables is not installed."; return 1; }
+  if ! wait_for_tun_interface 5; then
+    warn "Interface $TUN_DEV does not exist yet (agent not running, or TUN unavailable). The rules are applied anyway and take effect once it appears."
+  fi
+
+  # --- INPUT: let tunnel traffic reach this server (both roles) -----------------
+  ipt -N XTCP_TUN_IN 2>/dev/null || true
+  ipt -F XTCP_TUN_IN || return 1
+  ipt -C INPUT -j XTCP_TUN_IN 2>/dev/null || ipt -I INPUT 1 -j XTCP_TUN_IN || return 1
+  if [[ "$role" == outside ]]; then
+    ipt -A XTCP_TUN_IN -i "$TUN_DEV" -j ACCEPT || return 1
+  else
+    ipt -A XTCP_TUN_IN -i "$TUN_DEV" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
+    ipt -A XTCP_TUN_IN -i "$TUN_DEV" -p icmp -j ACCEPT || return 1
+  fi
+  ipt -A XTCP_TUN_IN -j RETURN || return 1
+  if [[ "$role" != iran ]]; then
+    log "Firewall: traffic arriving on $TUN_DEV is accepted on this server."
+    return 0
+  fi
+
+  # --- Iran: DNAT / SNAT / FORWARD / MSS ---------------------------------------
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null || return 1
+  local spec
+  for spec in nat:XTCP_TUN_DNAT nat:XTCP_TUN_SNAT filter:XTCP_TUN_FWD mangle:XTCP_TUN_MSS; do
+    ipt -t "${spec%%:*}" -N "${spec##*:}" 2>/dev/null || true
+    ipt -t "${spec%%:*}" -F "${spec##*:}" || return 1
+  done
+  ipt -t nat -C PREROUTING -j XTCP_TUN_DNAT 2>/dev/null || ipt -t nat -I PREROUTING 1 -j XTCP_TUN_DNAT || return 1
+  ipt -t nat -C POSTROUTING -o "$TUN_DEV" -j XTCP_TUN_SNAT 2>/dev/null || ipt -t nat -I POSTROUTING 1 -o "$TUN_DEV" -j XTCP_TUN_SNAT || return 1
+  ipt -C FORWARD -j XTCP_TUN_FWD 2>/dev/null || ipt -I FORWARD 1 -j XTCP_TUN_FWD || return 1
+  ipt -t mangle -C FORWARD -j XTCP_TUN_MSS 2>/dev/null || ipt -t mangle -I FORWARD 1 -j XTCP_TUN_MSS || return 1
+  ipt -t mangle -A XTCP_TUN_MSS -o "$TUN_DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TUNNEL_MSS" \
+    || warn "Could not add the TCP MSS clamp (outbound); if some sites fail to load, check MTU/MSS."
+  ipt -t mangle -A XTCP_TUN_MSS -i "$TUN_DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TUNNEL_MSS" \
+    || warn "Could not add the TCP MSS clamp (inbound); if some sites fail to load, check MTU/MSS."
+  ipt -t mangle -A XTCP_TUN_MSS -j RETURN || return 1
+  ipt -A XTCP_TUN_FWD -i "$TUN_DEV" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
+  local proto listen target
+  while read -r proto listen target; do
+    [[ -n "${proto:-}" ]] || continue
+    [[ "$proto" == tcp || "$proto" == udp ]] || continue
+    valid_port "$listen" && valid_port "$target" || continue
+    if is_reserved_port "$listen"; then
+      warn "Skipping forward for port $listen: reserved for this script's own control/fallback channels (control $FRPS_PORT, tcp fallback $TCP_FALLBACK_PORT, tcpmux $TCPMUX_PORT)."
+      continue
+    fi
+    # Match on "destination is this server" instead of on a WAN interface name:
+    # no dependence on default-route detection, works with several uplinks.
+    ipt -t nat -A XTCP_TUN_DNAT ! -i "$TUN_DEV" -m addrtype --dst-type LOCAL -p "$proto" --dport "$listen" \
+      -j DNAT --to-destination "$OUTSIDE_TUN_IP:$target" || return 1
+    ipt -t nat -A XTCP_TUN_SNAT -d "$OUTSIDE_TUN_IP" -p "$proto" --dport "$target" \
+      -j SNAT --to-source "$IRAN_TUN_IP" || return 1
+    ipt -A XTCP_TUN_FWD ! -i "$TUN_DEV" -o "$TUN_DEV" -d "$OUTSIDE_TUN_IP" -p "$proto" --dport "$target" \
+      -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT || return 1
+  done < "$CONF_DIR/forwards.tsv"
+  ipt -A XTCP_TUN_FWD -j RETURN || return 1
+  log "Rules applied. DNAT targets $OUTSIDE_TUN_IP, replies are SNATed from $IRAN_TUN_IP, TCP MSS fixed at $TUNNEL_MSS."
+}
+
+remove_iptables_rules() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  while ipt -C INPUT -j XTCP_TUN_IN 2>/dev/null; do ipt -D INPUT -j XTCP_TUN_IN || break; done
+  while ipt -t nat -C PREROUTING -j XTCP_TUN_DNAT 2>/dev/null; do ipt -t nat -D PREROUTING -j XTCP_TUN_DNAT || break; done
+  while ipt -t nat -C POSTROUTING -o "$TUN_DEV" -j XTCP_TUN_SNAT 2>/dev/null; do ipt -t nat -D POSTROUTING -o "$TUN_DEV" -j XTCP_TUN_SNAT || break; done
+  while ipt -C FORWARD -j XTCP_TUN_FWD 2>/dev/null; do ipt -D FORWARD -j XTCP_TUN_FWD || break; done
+  while ipt -t mangle -C FORWARD -j XTCP_TUN_MSS 2>/dev/null; do ipt -t mangle -D FORWARD -j XTCP_TUN_MSS || break; done
+  ipt -F XTCP_TUN_IN 2>/dev/null || true;            ipt -X XTCP_TUN_IN 2>/dev/null || true
+  ipt -t mangle -F XTCP_TUN_MSS 2>/dev/null || true; ipt -t mangle -X XTCP_TUN_MSS 2>/dev/null || true
+  ipt -t nat -F XTCP_TUN_DNAT 2>/dev/null || true;   ipt -t nat -X XTCP_TUN_DNAT 2>/dev/null || true
+  ipt -t nat -F XTCP_TUN_SNAT 2>/dev/null || true;   ipt -t nat -X XTCP_TUN_SNAT 2>/dev/null || true
+  ipt -F XTCP_TUN_FWD 2>/dev/null || true;           ipt -X XTCP_TUN_FWD 2>/dev/null || true
 }
 
 service_action() {
   require_root
   [[ -f "$CONF_DIR/role" ]] || die "Not installed yet."
-  local role="$(cat "$CONF_DIR/role")"
-  case "$role" in
+  case "$(get_role)" in
     iran) systemctl "$1" xtcp-tun-frps.service xtcp-tun-agent.service xtcp-tun-frpc-iran.service xtcp-tun-rules.service ;;
-    outside) systemctl "$1" xtcp-tun-frpc-outside.service xtcp-tun-agent.service ;;
+    outside) systemctl "$1" xtcp-tun-frpc-outside.service xtcp-tun-agent.service xtcp-tun-rules.service ;;
     *) die "The stored role is not valid." ;;
   esac
 }
 
-# Parses one comma-separated token into "listen target" (space separated).
-# Accepts "PORT" (target = listen) or "LISTEN:TARGET".
+# "PORT" (target = listen) or "LISTEN:TARGET" -> "listen target"
 _parse_port_entry() {
   local raw="$1" listen target
   raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
   [[ -n "$raw" ]] || return 1
-  if [[ "$raw" == *:* ]]; then
-    listen="${raw%%:*}"
-    target="${raw##*:}"
-  else
-    listen="$raw"
-    target="$raw"
-  fi
+  if [[ "$raw" == *:* ]]; then listen="${raw%%:*}"; target="${raw##*:}"; else listen="$raw"; target="$raw"; fi
   valid_port "$listen" || { warn "Invalid listen port skipped: $listen"; return 1; }
   valid_port "$target" || { warn "Invalid target port skipped: $target"; return 1; }
   printf '%s %s\n' "$listen" "$target"
 }
 
-# Used automatically at the end of install_iran, right after the tunnel
-# interface comes up. Unlike add_forward(), nothing here ever calls
-# die(): a skip, a typo, or a failed apply should fall through to "you
-# can do this later from menu option 7" rather than aborting the install
-# that already succeeded.
-prompt_initial_forwards() {
-  local proto ports_input entry parsed listen target added=() line
-  printf '\n'
-  read -rp "Port(s) to forward through the tunnel now, comma-separated (e.g. 1080,443, or 1080:1081,443 for a different target port) - press Enter to skip and add later from menu option 7: " ports_input
-  [[ -n "$ports_input" ]] || { log "No ports entered; add forwards later from menu option 7."; return 0; }
-  read -rp "Protocol for these ports (tcp/udp) [tcp]: " proto
-  proto="${proto,,}"
-  proto="${proto:-tcp}"
-  if [[ "$proto" != tcp && "$proto" != udp ]]; then
-    warn "Protocol must be tcp or udp; skipped. Add forwards later from menu option 7."
-    return 0
-  fi
+# Adds the entries to forwards.tsv and applies; restores the old file if applying fails.
+# usage: _add_forward_entries PROTO "ports,csv"   (returns 0 on success)
+_add_forward_entries() {
+  local proto="$1" ports_input="$2" entry parsed listen target line backup
+  local -a added=() entries=()
+  backup="$(mktemp)"
+  cp "$CONF_DIR/forwards.tsv" "$backup"
   IFS=',' read -ra entries <<< "$ports_input"
   for entry in "${entries[@]}"; do
     parsed="$(_parse_port_entry "$entry")" || continue
     listen="${parsed% *}"
     target="${parsed#* }"
     if is_reserved_port "$listen"; then
-      warn "Port $listen is reserved for this script's own control/fallback channels (FRP control: $FRPS_PORT, TCP fallback: $TCP_FALLBACK_PORT, TCPMUX fallback: $TCPMUX_PORT); skipped."
+      warn "Port $listen is reserved for this script's own channels (control $FRPS_PORT, tcp fallback $TCP_FALLBACK_PORT, tcpmux $TCPMUX_PORT); skipped."
       continue
     fi
     confirm_not_ssh_port "$listen" || { warn "Skipped port $listen."; continue; }
@@ -1293,80 +1081,64 @@ prompt_initial_forwards() {
     printf '%s %s %s\n' "$proto" "$listen" "$target" >> "$CONF_DIR/forwards.tsv"
     added+=("$proto $listen $target")
   done
-  if [[ ${#added[@]} -eq 0 ]]; then
-    warn "No forwarding rules were added."
-    return 0
+  if (( ${#added[@]} == 0 )); then
+    rm -f "$backup"
+    warn "No new forwarding rules were added."
+    return 1
   fi
   if ! apply_rules; then
-    for line in "${added[@]}"; do
-      sed -i "\\|^$line\$|d" "$CONF_DIR/forwards.tsv"
-    done
-    warn "Applying the rules failed; the new entries were rolled back. Try again later from menu option 7."
+    cat "$backup" > "$CONF_DIR/forwards.tsv"
+    rm -f "$backup"
+    apply_rules >/dev/null 2>&1 || true
+    warn "Applying the rules failed; the new entries were rolled back."
+    return 1
+  fi
+  rm -f "$backup"
+  log "Added forwarding rule(s):"
+  for line in "${added[@]}"; do printf '  %s\n' "$line"; done
+  warn "Because of SNAT the outside service sees the source address as $IRAN_TUN_IP (the real client IP is not passed through). The service on the outside server must listen on 0.0.0.0 (or $OUTSIDE_TUN_IP)."
+  return 0
+}
+
+prompt_initial_forwards() {
+  local proto ports_input
+  printf '\n'
+  read -rp "Port(s) to forward through the tunnel now, comma-separated (e.g. 1080,443 or 1080:1081,443 for a different target port) - Enter to skip and add later from option 7: " ports_input
+  [[ -n "$ports_input" ]] || { log "No ports entered; add forwards later from option 7."; return 0; }
+  read -rp "Protocol for these ports (tcp/udp) [tcp]: " proto
+  proto="${proto,,}"; proto="${proto:-tcp}"
+  if [[ "$proto" != tcp && "$proto" != udp ]]; then
+    warn "Protocol must be tcp or udp; skipped. Add forwards later from option 7."
     return 0
   fi
-  log "Added forwarding rule(s):"
-  for line in "${added[@]}"; do
-    printf '  %s\n' "$line"
-  done
-  warn "Because of SNAT, the outside service will see the source address as $IRAN_TUN_IP; the real client IP is not passed through."
+  _add_forward_entries "$proto" "$ports_input" || true
 }
 
 add_forward() {
   require_root
-  [[ -f "$CONF_DIR/role" && "$(cat "$CONF_DIR/role")" == iran ]] || die "Adding a forward is only done on the Iran server."
-  local proto ports_input entry parsed listen target added=() line
+  [[ "$(get_role)" == iran ]] || die "Adding a forward is only done on the Iran server."
+  local proto ports_input
   read -rp "Protocol (tcp/udp): " proto
   proto="${proto,,}"
   [[ "$proto" == tcp || "$proto" == udp ]] || die "Protocol must be tcp or udp."
-  read -rp "Port(s) to forward, comma-separated (e.g. 1080,443, or 1080:1081,443 for a different target port): " ports_input
+  read -rp "Port(s) to forward, comma-separated (e.g. 1080,443 or 1080:1081,443 for a different target port): " ports_input
   [[ -n "$ports_input" ]] || die "No ports entered."
-  IFS=',' read -ra entries <<< "$ports_input"
-  for entry in "${entries[@]}"; do
-    parsed="$(_parse_port_entry "$entry")" || continue
-    listen="${parsed% *}"
-    target="${parsed#* }"
-    if is_reserved_port "$listen"; then
-      warn "Port $listen is reserved for this script's own control/fallback channels (FRP control: $FRPS_PORT, TCP fallback: $TCP_FALLBACK_PORT, TCPMUX fallback: $TCPMUX_PORT); skipped."
-      continue
-    fi
-    confirm_not_ssh_port "$listen" || { warn "Skipped port $listen."; continue; }
-    if awk -v p="$proto" -v l="$listen" '$1==p && $2==l {found=1} END{exit !found}' "$CONF_DIR/forwards.tsv"; then
-      warn "A rule for $proto/$listen already exists; skipped."
-      continue
-    fi
-    printf '%s %s %s\n' "$proto" "$listen" "$target" >> "$CONF_DIR/forwards.tsv"
-    added+=("$proto $listen $target")
-  done
-  if [[ ${#added[@]} -eq 0 ]]; then
-    warn "No new forwarding rules were added."
-    return 0
-  fi
-  if ! apply_rules; then
-    for line in "${added[@]}"; do
-      sed -i "\\|^$line\$|d" "$CONF_DIR/forwards.tsv"
-    done
-    die "Applying the rules failed; the new entries were rolled back."
-  fi
-  log "Added forwarding rule(s):"
-  for line in "${added[@]}"; do
-    printf '  %s\n' "$line"
-  done
-  warn "Because of SNAT, the outside service will see the source address as $IRAN_TUN_IP; the real client IP is not passed through."
+  _add_forward_entries "$proto" "$ports_input" || return 1
 }
 
 remove_forward() {
   require_root
-  [[ -f "$CONF_DIR/role" && "$(cat "$CONF_DIR/role")" == iran ]] || die "Removing a forward is only done on the Iran server."
-  local proto ports_input entry listen tmp backup removed=() notfound=()
+  [[ "$(get_role)" == iran ]] || die "Removing a forward is only done on the Iran server."
+  local proto ports_input entry listen tmp backup
+  local -a removed=() notfound=() entries=()
   read -rp "Protocol (tcp/udp): " proto
   proto="${proto,,}"
   [[ "$proto" == tcp || "$proto" == udp ]] || die "Protocol must be tcp or udp."
   read -rp "Listen port(s) to remove, comma-separated (e.g. 1080,443): " ports_input
   [[ -n "$ports_input" ]] || die "No ports entered."
   IFS=',' read -ra entries <<< "$ports_input"
-  backup="$(mktemp)"
+  backup="$(mktemp)"; tmp="$(mktemp)"
   cp "$CONF_DIR/forwards.tsv" "$backup"
-  tmp="$(mktemp)"
   cp "$CONF_DIR/forwards.tsv" "$tmp"
   for entry in "${entries[@]}"; do
     listen="$(printf '%s' "$entry" | tr -d '[:space:]')"
@@ -1379,29 +1151,26 @@ remove_forward() {
       notfound+=("$proto/$listen")
     fi
   done
-  if [[ ${#removed[@]} -eq 0 ]]; then
+  if (( ${#removed[@]} == 0 )); then
     rm -f "$tmp" "$backup"
     die "No matching rule(s) were found to remove."
   fi
   cat "$tmp" > "$CONF_DIR/forwards.tsv"
   rm -f "$tmp"
-  # Same rollback-on-failure discipline as add_forward(): either the
-  # config change and the live iptables rules move together, or neither
-  # does, so forwards.tsv never silently drifts out of sync with what's
-  # actually applied.
   if ! apply_rules; then
     cat "$backup" > "$CONF_DIR/forwards.tsv"
     rm -f "$backup"
+    apply_rules >/dev/null 2>&1 || true
     die "Applying the rules failed; the removal was rolled back and the previous rules are still in place."
   fi
   rm -f "$backup"
   log "Removed: ${removed[*]}"
-  [[ ${#notfound[@]} -eq 0 ]] || warn "Not found (skipped): ${notfound[*]}"
+  if (( ${#notfound[@]} > 0 )); then warn "Not found (skipped): ${notfound[*]}"; fi
 }
 
 list_forwards() {
   require_root
-  if [[ -f "$CONF_DIR/role" && "$(cat "$CONF_DIR/role")" == iran ]]; then
+  if [[ "$(get_role)" == iran ]]; then
     if [[ -s "$CONF_DIR/forwards.tsv" ]]; then
       printf '\nProto  Listen-port  Target-port\n'
       cat "$CONF_DIR/forwards.tsv"
@@ -1415,7 +1184,7 @@ list_forwards() {
 
 show_credentials() {
   require_root
-  [[ -f "$CONF_DIR/role" && "$(cat "$CONF_DIR/role")" == iran ]] || die "Connection info is only stored on the Iran server."
+  [[ "$(get_role)" == iran ]] || die "Connection info is only stored on the Iran server."
   local proto
   proto="$(cat "$CONF_DIR/transport_protocol" 2>/dev/null || true)"
   proto="${proto:-tcp}"
@@ -1426,23 +1195,20 @@ show_credentials() {
 show_logs() {
   require_root
   [[ -f "$CONF_DIR/role" ]] || die "Not installed yet."
-  local role="$(cat "$CONF_DIR/role")"
+  local role f
+  role="$(get_role)"
+  printf '\n--- Tunnel agent ---\n'
+  print_agent_state
   printf '\n--- Listening ports (local) ---\n'
   if ! ss -tlnp 2>/dev/null | grep -E ":($FRPS_PORT|$PIPE_SERVER_PORT|$PIPE_VISITOR_PORT|$TCP_FALLBACK_PORT|$TCPMUX_PORT)\b"; then
-    printf '  None of the expected ports are listening yet.\n'
+    printf '  None of the expected ports is listening yet.\n'
   fi
   if [[ "$role" == iran ]]; then
-    journalctl --no-pager -n 70 -u xtcp-tun-frps.service -u xtcp-tun-agent.service -u xtcp-tun-frpc-iran.service
+    journalctl --no-pager -n 70 -u xtcp-tun-frps.service -u xtcp-tun-agent.service -u xtcp-tun-frpc-iran.service || true
   else
-    journalctl --no-pager -n 70 -u xtcp-tun-agent.service -u xtcp-tun-frpc-outside.service
+    journalctl --no-pager -n 70 -u xtcp-tun-agent.service -u xtcp-tun-frpc-outside.service || true
   fi
-  # frps/frpc log to their own file (see log.to in the generated .toml
-  # configs) rather than to journald/stdout, so a startup error or crash
-  # inside either of them (bad config, port already taken, etc.) never
-  # shows up in the journalctl output above - only systemd's generic
-  # "Main process exited" line does. Tail those files too, or that kind
-  # of failure is effectively invisible from this menu option.
-  local f
+  # frps/frpc write to their own log files, not to journald.
   for f in "$LOG_DIR"/*.log; do
     [[ -f "$f" ]] || continue
     printf '\n--- tail -n 40 %s ---\n' "$f"
@@ -1452,47 +1218,62 @@ show_logs() {
 
 uninstall_all() {
   require_root
-  [[ -f "$CONF_DIR/role" ]] || { log "Not installed."; return 0; }
-  local role old_forward peer
-  role="$(cat "$CONF_DIR/role")"
-  printf '\nThis will remove the services, XTCP-TUN files, and the iptables rules created by this script.\n'
+  if [[ ! -f "$CONF_DIR/role" && ! -d "$BASE_DIR" && ! -f "$UNIT_DIR/xtcp-tun-agent.service" ]]; then
+    log "Not installed."
+    return 0
+  fi
+  local old_forward peer confirm
+  printf '\nThis will remove the services, XTCP-TUN files, and the firewall rules created by this script.\n'
   read -rp "Type DELETE exactly to confirm: " confirm
   [[ "$confirm" == DELETE ]] || { log "Cancelled."; return 0; }
   remove_iptables_rules
   systemctl disable --now xtcp-tun-rules.service xtcp-tun-frpc-iran.service xtcp-tun-frpc-outside.service xtcp-tun-agent.service xtcp-tun-frps.service >/dev/null 2>&1 || true
-  if [[ -f "$CONF_DIR/ufw_added_tcp_control" ]] && command -v ufw >/dev/null 2>&1; then
-    ufw --force delete allow "${FRPS_PORT}/tcp" >/dev/null 2>&1 || true
-  fi
-  if [[ -f "$CONF_DIR/ufw_added_udp_peer" ]] && command -v ufw >/dev/null 2>&1; then
-    peer="$(cat "$CONF_DIR/ufw_added_udp_peer" 2>/dev/null || true)"
-    if valid_ipv4 "$peer"; then
-      ufw --force delete allow from "$peer" to any proto udp >/dev/null 2>&1 || true
-      ufw --force delete allow from "$peer" to any port "$TCP_FALLBACK_PORT" proto tcp >/dev/null 2>&1 || true
-      ufw --force delete allow from "$peer" to any port "$TCPMUX_PORT" proto tcp >/dev/null 2>&1 || true
+  if command -v ufw >/dev/null 2>&1; then
+    if [[ -f "$CONF_DIR/ufw_added_tcp_control" ]]; then ufw --force delete allow "${FRPS_PORT}/tcp" >/dev/null 2>&1 || true; fi
+    if [[ -f "$CONF_DIR/ufw_added_udp_control" ]]; then ufw --force delete allow "${FRPS_PORT}/udp" >/dev/null 2>&1 || true; fi
+    if [[ -f "$CONF_DIR/ufw_added_tun_iface" ]]; then ufw --force delete allow in on "$TUN_DEV" >/dev/null 2>&1 || true; fi
+    if [[ -f "$CONF_DIR/ufw_added_udp_peer" ]]; then
+      peer="$(cat "$CONF_DIR/ufw_added_udp_peer" 2>/dev/null || true)"
+      if valid_ipv4 "$peer"; then
+        ufw --force delete allow from "$peer" to any proto udp >/dev/null 2>&1 || true
+        ufw --force delete allow from "$peer" to any port "$TCP_FALLBACK_PORT" proto tcp >/dev/null 2>&1 || true
+        ufw --force delete allow from "$peer" to any port "$TCPMUX_PORT" proto tcp >/dev/null 2>&1 || true
+      fi
     fi
   fi
-  rm -f /etc/systemd/system/xtcp-tun-frps.service \
-        /etc/systemd/system/xtcp-tun-agent.service \
-        /etc/systemd/system/xtcp-tun-frpc-iran.service \
-        /etc/systemd/system/xtcp-tun-frpc-outside.service \
-        /etc/systemd/system/xtcp-tun-rules.service
+  rm -f "$UNIT_DIR/xtcp-tun-frps.service" "$UNIT_DIR/xtcp-tun-agent.service" \
+        "$UNIT_DIR/xtcp-tun-frpc-iran.service" "$UNIT_DIR/xtcp-tun-frpc-outside.service" \
+        "$UNIT_DIR/xtcp-tun-rules.service"
   systemctl daemon-reload
   ip link delete dev "$TUN_DEV" >/dev/null 2>&1 || true
-  rm -f /etc/sysctl.d/90-xtcp-tun.conf
+  rm -f /etc/sysctl.d/90-xtcp-tun.conf /etc/modules-load.d/xtcp-tun.conf
   if [[ -f "$CONF_DIR/old_ip_forward" ]]; then
     old_forward="$(cat "$CONF_DIR/old_ip_forward" 2>/dev/null || printf '0')"
     [[ "$old_forward" == 0 || "$old_forward" == 1 ]] || old_forward=0
     sysctl -w "net.ipv4.ip_forward=$old_forward" >/dev/null 2>&1 || true
   fi
-  rm -rf "$BASE_DIR" "$CONF_DIR" "$LOG_DIR"
+  rm -rf "$BASE_DIR" "$CONF_DIR" "$LOG_DIR" "$(dirname "$STATE_FILE")"
   rm -f "$MANAGER_PATH"
-  log "Uninstall complete. Shared packages like Python/iptables were left installed so other services aren't affected."
+  log "Uninstall complete. Shared packages like Python/iptables were left installed."
+}
+
+# Runs one menu action in a subshell WITH errexit, without letting a failure
+# terminate the menu (the old `( action )` form exited the whole script under set -e).
+run_action() {
+  local rc
+  set +e
+  ( set -e; "$@" )
+  rc=$?
+  set -e
+  if (( rc != 0 )); then warn "The action stopped (exit code $rc) - see the message above."; fi
+  return 0
 }
 
 menu() {
   require_root
+  local choice
   while true; do
-    printf '\n\033[1;36m========== XTCP-TUN Manager ==========%s\033[0m\n' ""
+    printf '\n\033[1;36m========== XTCP-TUN Manager v%s ==========\033[0m\n' "$SCRIPT_VERSION"
     printf '1) Install/configure the Iran side\n'
     printf '2) Install/configure the outside side\n'
     printf '3) Tunnel and service status\n'
@@ -1505,33 +1286,41 @@ menu() {
     printf '10) Show outside-connection credentials (Iran only)\n'
     printf '11) View logs\n'
     printf '12) Full uninstall\n'
+    printf '13) Test the tunnel (ping + diagnosis)\n'
+    printf '14) Repair / upgrade in place (run on BOTH servers after updating the script)\n'
     printf '0) Exit\n'
-    read -rp 'Your choice: ' choice
-    # Each action runs in a subshell: if it hits die()/exit (bad input,
-    # a failed step, etc.) only that subshell exits, so the menu loop
-    # keeps running instead of the whole script terminating.
+    read -rp 'Your choice: ' choice || exit 0
     case "$choice" in
-      1) ( install_iran ) ;;
-      2) ( install_outside ) ;;
-      3) ( status_all ) ;;
-      4) ( service_action start ) ;;
-      5) ( service_action stop ) ;;
-      6) ( service_action restart ) ;;
-      7) ( add_forward ) ;;
-      8) ( remove_forward ) ;;
-      9) ( list_forwards ) ;;
-      10) ( show_credentials ) ;;
-      11) ( show_logs ) ;;
-      12) ( uninstall_all ) ;;
+      1) run_action install_iran ;;
+      2) run_action install_outside ;;
+      3) run_action status_all ;;
+      4) run_action service_action start ;;
+      5) run_action service_action stop ;;
+      6) run_action service_action restart ;;
+      7) run_action add_forward ;;
+      8) run_action remove_forward ;;
+      9) run_action list_forwards ;;
+      10) run_action show_credentials ;;
+      11) run_action show_logs ;;
+      12) run_action uninstall_all ;;
+      13) run_action test_tunnel ;;
+      14) run_action repair_all ;;
       0) exit 0 ;;
       *) warn "Invalid option." ;;
     esac
   done
 }
 
-if [[ "${1:-}" == "--apply-rules" ]]; then
-  apply_rules
-  exit 0
-fi
+main() {
+  case "${1:-}" in
+    --apply-rules) apply_rules || exit 1; exit 0 ;;
+    --status) status_all; exit 0 ;;
+    --test) test_tunnel; exit $? ;;
+    --repair) repair_all; exit 0 ;;
+  esac
+  menu
+}
 
-menu
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
